@@ -7,6 +7,7 @@
 
 mod config;
 mod proxy;
+mod pull;
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -17,18 +18,21 @@ use clap::{Arg, ArgAction, ArgMatches, Command};
 
 use config::Config;
 
-/// Build the registry — the composition root. Engine plug-ins (stt/tts/chat/see)
-/// will be registered here as they are implemented.
+/// Build the registry — the composition root. Every engine runs out-of-process:
+/// it ships as its own `chord-<name>` binary and is registered here as an
+/// exec-proxy. The `chord` binary therefore links no engine code (which also
+/// sidesteps native-library symbol clashes, e.g. the two copies of ggml). See
+/// proxy.rs.
 fn build_registry() -> Registry {
     let mut reg = Registry::new();
-    chord_stt::register(&mut reg);
-    chord_tts::register(&mut reg);
-    chord_chat::register(&mut reg);
-    chord_see::register(&mut reg);
-    // `draw` (text->image, stable-diffusion.cpp) runs out-of-process: its bundled
-    // ggml can't statically co-link with llama.cpp's, so it ships as the separate
-    // `chord-draw` binary and we proxy to it. See proxy.rs.
+    reg.register(Box::new(proxy::ExecProxy::stt()));
+    reg.register(Box::new(proxy::ExecProxy::tts()));
+    reg.register(Box::new(proxy::ExecProxy::chat()));
+    reg.register(Box::new(proxy::ExecProxy::see()));
     reg.register(Box::new(proxy::ExecProxy::draw()));
+    reg.register(Box::new(proxy::ExecProxy::diarize()));
+    reg.register(Box::new(proxy::ExecProxy::vad()));
+    reg.register(Box::new(proxy::ExecProxy::langid()));
     reg
 }
 
@@ -57,13 +61,28 @@ fn main() {
             print_config(&config);
             Ok(())
         }
+        Some(("pull", sub)) => pull::run(sub),
         Some(("pipeline", sub)) => run_pipeline(&reg, sub, &config),
-        Some((name, sub)) => match reg.get(name) {
-            Some(t) => run_filter(t, sub, &config),
-            None => {
-                eprintln!("chord: unknown command: {name}");
-                exit(2);
+        Some((name, sub)) => match sub.get_one::<String>("backend").map(String::as_str) {
+            // An explicit --backend: use an alternate engine if one exists, else
+            // the default if it already is that backend.
+            Some(b) => {
+                if let Some(alt) = proxy::alternate(name, b) {
+                    run_filter(&alt, sub, &config)
+                } else if let Some(t) = reg.get(name).filter(|t| t.backend() == b) {
+                    run_filter(t, sub, &config)
+                } else {
+                    eprintln!("chord: {name} has no backend {b:?} (see `chord ls`)");
+                    exit(2);
+                }
             }
+            None => match reg.get(name) {
+                Some(t) => run_filter(t, sub, &config),
+                None => {
+                    eprintln!("chord: unknown command: {name}");
+                    exit(2);
+                }
+            },
         },
         None => {
             eprintln!("chord: no command (try `chord --help`)");
@@ -72,8 +91,16 @@ fn main() {
     };
 
     if let Err(err) = result {
-        eprintln!("chord: {err}");
-        exit(1);
+        // Adopt a categorized exit code when present. A `Child` error means a
+        // spawned engine already printed the message, so don't repeat it.
+        let (code, reported) = err
+            .downcast_ref::<chord_core::ChordError>()
+            .map(|c| (c.exit_code(), c.already_reported()))
+            .unwrap_or((1, false));
+        if !reported {
+            eprintln!("chord: {err}");
+        }
+        exit(code);
     }
 }
 
@@ -92,7 +119,36 @@ fn build_cli(reg: &Registry) -> Command {
                 .value_parser(clap::value_parser!(String))
                 .help("config YAML (default: $CHORD_CONFIG, ./chord.yaml, ~/.config/chord/config.yaml)"),
         )
+        .arg(
+            Arg::new("format")
+                .long("format")
+                .global(true)
+                .value_parser(["text", "jsonl"])
+                .default_value("text")
+                .help("output format: text (default), or jsonl for machine-readable lifecycle/error events on stderr"),
+        )
+        .arg(
+            Arg::new("backend")
+                .long("backend")
+                .global(true)
+                .value_parser(clap::value_parser!(String))
+                .help("select a transform's inference backend (see `chord ls`); default if omitted"),
+        )
         .subcommand(Command::new("ls").about("List available transforms"))
+        .subcommand(
+            Command::new("pull")
+                .about("Download a model: a transform's default, or any hf: reference")
+                .arg(
+                    Arg::new("transform")
+                        .required(false)
+                        .help("a transform whose default model to fetch (e.g. stt)"),
+                )
+                .arg(
+                    Arg::new("model")
+                        .long("model")
+                        .help("a Hugging Face reference to download, e.g. hf:org/repo:Q4_K_M"),
+                ),
+        )
         .subcommand(Command::new("kinds").about("List the data kinds chord understands"))
         .subcommand(Command::new("config").about("Show the resolved configuration"))
         .subcommand(
@@ -129,11 +185,23 @@ fn transform_command(t: &dyn Transform) -> Command {
         .about(format!("{}  ({} -> {})", t.describe(), t.from(), t.to()))
         .arg(
             Arg::new("input")
-                .help("input file (default: stdin)")
+                .help("input file, or inline text for text inputs (default: stdin)")
                 .value_parser(clap::value_parser!(String))
                 .index(1),
         );
-    for spec in t.options() {
+    // Accept options from the default backend AND any alternate backends, so
+    // `--backend X` flags parse regardless of which engine runs. Each engine
+    // reads only the keys it declares; dedup by key.
+    let alternates = proxy::alternates(t.name());
+    let mut seen = std::collections::HashSet::new();
+    for spec in t
+        .options()
+        .iter()
+        .chain(alternates.iter().flat_map(|p| p.options()))
+    {
+        if !seen.insert(spec.key) {
+            continue;
+        }
         let mut arg = Arg::new(spec.key).long(spec.key).help(spec.help);
         if spec.takes_value {
             arg = arg.value_parser(clap::value_parser!(String));
@@ -158,6 +226,15 @@ fn opts_from(t: &dyn Transform, m: &ArgMatches, config: &Config) -> chord_core::
             opts.insert(spec.key, "true");
         }
     }
+    // The global `--format` flag isn't an engine option; stash it under a
+    // reserved key so the exec-proxy can forward it to the engine binary.
+    // `try_get_one` (not `get_one`) because pipeline stages are parsed by a
+    // command that doesn't define `format` — looking it up there would panic.
+    if let Ok(Some(fmt)) = m.try_get_one::<String>("format") {
+        if fmt != "text" {
+            opts.insert("__format", fmt.clone());
+        }
+    }
     opts
 }
 
@@ -166,14 +243,27 @@ fn opts_from(t: &dyn Transform, m: &ArgMatches, config: &Config) -> chord_core::
 /// Options precedence: config-file section (lowest), then named CLI flags.
 fn run_filter(t: &dyn Transform, m: &ArgMatches, config: &Config) -> Result<()> {
     let opts = opts_from(t, m, config);
+    pull::ensure(t, &opts)?;
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
     match m.get_one::<String>("input") {
-        Some(path) if path != "-" => {
-            let mut f = File::open(path)?;
-            t.apply(&mut f, &mut out, &opts)
+        Some(arg) if arg != "-" => {
+            if std::path::Path::new(arg).is_file() {
+                let mut f = File::open(arg)?;
+                t.apply(&mut f, &mut out, &opts)
+            } else if t.from() == Kind::Text {
+                // Not a file, and this transform consumes text: treat the
+                // argument as the literal input, so `chord chat "hi"` works.
+                let mut cursor = io::Cursor::new(arg.clone().into_bytes());
+                t.apply(&mut cursor, &mut out, &opts)
+            } else {
+                Err(
+                    chord_core::ChordError::BadInput(format!("input file not found: {arg:?}"))
+                        .into(),
+                )
+            }
         }
         _ => {
             let stdin = io::stdin();
@@ -229,10 +319,28 @@ fn run_pipeline(reg: &Registry, m: &ArgMatches, config: &Config) -> Result<()> {
         plan.push(Stage { t, opts, input });
     }
 
-    // Initial input: the first stage's file arg, else stdin.
+    // Make sure every stage's models are present before the chain starts, so a
+    // missing download is resolved up front (one prompt) rather than mid-run.
+    for stage in &plan {
+        pull::ensure(stage.t, &stage.opts)?;
+    }
+
+    // Initial input: the first stage's file arg (or literal text for a
+    // text-input first stage), else stdin.
     let mut data: Vec<u8> = Vec::new();
     match plan[0].input.as_deref() {
-        Some(p) if p != "-" => data = std::fs::read(p)?,
+        Some(arg) if arg != "-" => {
+            if std::path::Path::new(arg).is_file() {
+                data = std::fs::read(arg)?;
+            } else if plan[0].t.from() == Kind::Text {
+                data = arg.as_bytes().to_vec();
+            } else {
+                return Err(chord_core::ChordError::BadInput(format!(
+                    "input file not found: {arg:?}"
+                ))
+                .into());
+            }
+        }
         _ => {
             io::stdin().lock().read_to_end(&mut data)?;
         }
@@ -257,12 +365,21 @@ fn run_pipeline(reg: &Registry, m: &ArgMatches, config: &Config) -> Result<()> {
 }
 
 fn print_ls(reg: &Registry) {
-    println!("{:<10} {:<16} DESCRIPTION", "NAME", "KINDS");
+    println!(
+        "{:<8} {:<15} {:<22} DESCRIPTION",
+        "NAME", "KINDS", "BACKEND"
+    );
     for t in reg.all() {
+        let backend = if t.backend().is_empty() {
+            "-"
+        } else {
+            t.backend()
+        };
         println!(
-            "{:<10} {:<16} {}",
+            "{:<8} {:<15} {:<22} {}",
             t.name(),
             format!("{} -> {}", t.from(), t.to()),
+            backend,
             t.describe()
         );
     }

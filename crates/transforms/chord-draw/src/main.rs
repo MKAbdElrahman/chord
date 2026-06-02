@@ -12,29 +12,80 @@ use std::io::{IsTerminal, Read, Write};
 use std::process::exit;
 use std::time::Duration;
 
-use clap::{Arg, Command};
+use clap::{Arg, ArgMatches, Command};
 use diffusion_rs::api::gen_img;
 use diffusion_rs::preset::{Preset, PresetBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
 
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("chord-draw: {e}");
-        exit(1);
+    let m = cli().get_matches();
+    let jsonl = m.get_one::<String>("format").map(String::as_str) == Some("jsonl");
+    if jsonl {
+        eprintln!(
+            "{}",
+            serde_json::json!({ "event": "start", "transform": "draw" })
+        );
+    }
+    match run(&m) {
+        Ok(()) => {
+            if jsonl {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({ "event": "done", "transform": "draw" })
+                );
+            }
+        }
+        Err(e) => {
+            // Match the shared exit-code convention (2 bad input, 3 missing
+            // model, 1 otherwise) so the proxy can propagate it like any engine.
+            let ce = e.downcast_ref::<chord_core::ChordError>();
+            let code = ce.map(chord_core::ChordError::exit_code).unwrap_or(1);
+            if jsonl {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "error",
+                        "transform": "draw",
+                        "code": code,
+                        "kind": ce.map(chord_core::ChordError::kind).unwrap_or("engine"),
+                        "message": e.to_string(),
+                    })
+                );
+            } else {
+                eprintln!("chord-draw: {e}");
+            }
+            exit(code);
+        }
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let m = Command::new("chord-draw")
+fn cli() -> Command {
+    Command::new("chord-draw")
         .about("text -> image (stable-diffusion.cpp)")
-        .arg(Arg::new("input").index(1).help("prompt file (default: stdin)"))
-        .arg(Arg::new("model").long("model").help("sd-turbo | sdxl-turbo | sd1.5"))
+        .arg(
+            Arg::new("input")
+                .index(1)
+                .help("prompt file (default: stdin)"),
+        )
+        .arg(
+            Arg::new("model")
+                .long("model")
+                .help("sd-turbo | sdxl-turbo | sd1.5"),
+        )
         .arg(Arg::new("steps").long("steps"))
         .arg(Arg::new("seed").long("seed"))
         .arg(Arg::new("width").long("width"))
         .arg(Arg::new("height").long("height"))
-        .get_matches();
+        .arg(
+            Arg::new("format")
+                .long("format")
+                .value_parser(["text", "jsonl"])
+                .default_value("text")
+                .help("output format: text, or jsonl for events on stderr"),
+        )
+}
 
+fn run(m: &ArgMatches) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Prompt from file arg, else stdin.
     let prompt = match m.get_one::<String>("input") {
         Some(p) if p != "-" => std::fs::read_to_string(p)?,
@@ -46,20 +97,35 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     let prompt = prompt.trim().to_string();
     if prompt.is_empty() {
-        return Err("no prompt on input".into());
+        return Err(chord_core::ChordError::BadInput("no prompt on input".to_string()).into());
     }
 
-    let model = m.get_one::<String>("model").map(String::as_str).unwrap_or("sd-turbo");
+    let model = m
+        .get_one::<String>("model")
+        .map(String::as_str)
+        .unwrap_or("sd-turbo");
     let preset = match model {
         "sd-turbo" => Preset::SDTurbo,
         "sdxl-turbo" => Preset::SDXLTurbo1_0,
         "sd1.5" | "sd15" => Preset::StableDiffusion1_5,
-        other => return Err(format!("unknown model preset {other:?} (sd-turbo, sdxl-turbo, sd1.5)").into()),
+        other => {
+            return Err(
+                format!("unknown model preset {other:?} (sd-turbo, sdxl-turbo, sd1.5)").into(),
+            )
+        }
     };
-    let steps = m.get_one::<String>("steps").and_then(|s| s.parse::<i32>().ok());
-    let seed = m.get_one::<String>("seed").and_then(|s| s.parse::<i64>().ok());
-    let width = m.get_one::<String>("width").and_then(|s| s.parse::<i32>().ok());
-    let height = m.get_one::<String>("height").and_then(|s| s.parse::<i32>().ok());
+    let steps = m
+        .get_one::<String>("steps")
+        .and_then(|s| s.parse::<i32>().ok());
+    let seed = m
+        .get_one::<String>("seed")
+        .and_then(|s| s.parse::<i64>().ok());
+    let width = m
+        .get_one::<String>("width")
+        .and_then(|s| s.parse::<i32>().ok());
+    let height = m
+        .get_one::<String>("height")
+        .and_then(|s| s.parse::<i32>().ok());
 
     let out_path = std::env::temp_dir().join(format!("chord-draw-{}.png", std::process::id()));
 

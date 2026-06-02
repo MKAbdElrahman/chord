@@ -1,0 +1,12 @@
+[package]
+name = "chord-hf"
+description = "Resolve and download Hugging Face model references (hf:org/repo:QUANT) via the official hf-hub client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chord-core = { path = "../chord-core" }
+# HF's own Rust client; sync (ureq) API only.
+hf-hub = { version = "0.4", default-features = false, features = ["ureq", "native-tls"] }

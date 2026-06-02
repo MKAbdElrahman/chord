@@ -1,0 +1,12 @@
+[package]
+name = "chord-runner"
+description = "Shared filter runner: drive a chord_core::Transform as a stdin->stdout CLI binary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chord-core = { path = "../chord-core" }
+clap = "4"
+serde_json = "1"

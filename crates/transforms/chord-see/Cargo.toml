@@ -6,8 +6,14 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "chord-see"
+path = "src/main.rs"
+
 [dependencies]
 chord-core = { path = "../../chord-core" }
+chord-runner = { path = "../../chord-runner" }
+chord-hf = { path = "../../chord-hf" }
 llama-cpp-2 = { version = "0.1.146", features = ["mtmd"] }
 llama-cpp-sys-2 = "0.1.146"
 encoding_rs = "0.8"

@@ -10,10 +10,12 @@
 //! It has **no model/engine dependencies** (standard library only). Engines
 //! live in separate plug-in crates that depend on this one — never the reverse.
 
+mod error;
 mod kind;
 mod registry;
 mod transform;
 
+pub use error::ChordError;
 pub use kind::Kind;
 pub use registry::Registry;
 pub use transform::{OptionSpec, Options, Transform};

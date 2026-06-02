@@ -17,25 +17,45 @@ mod preprocess;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use chord_core::{Kind, OptionSpec, Options, Registry, Result, Transform};
+use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Transform};
 use ort::session::Session;
 
 const OPTS: &[OptionSpec] = &[
-    OptionSpec { key: "voice", help: "voice preset name or JSON path (default M1)", takes_value: true },
-    OptionSpec { key: "lang", help: "language code (default en)", takes_value: true },
-    OptionSpec { key: "steps", help: "denoising steps 5-12 (default 8)", takes_value: true },
-    OptionSpec { key: "speed", help: "speech speed 0.7-2.0 (default 1.05)", takes_value: true },
-    OptionSpec { key: "silence", help: "seconds between chunks (default 0.3)", takes_value: true },
-    OptionSpec { key: "assets", help: "Supertonic assets directory", takes_value: true },
+    OptionSpec {
+        key: "voice",
+        help: "voice preset name or JSON path (default M1)",
+        takes_value: true,
+    },
+    OptionSpec {
+        key: "lang",
+        help: "language code (default en)",
+        takes_value: true,
+    },
+    OptionSpec {
+        key: "steps",
+        help: "denoising steps 5-12 (default 8)",
+        takes_value: true,
+    },
+    OptionSpec {
+        key: "speed",
+        help: "speech speed 0.7-2.0 (default 1.05)",
+        takes_value: true,
+    },
+    OptionSpec {
+        key: "silence",
+        help: "seconds between chunks (default 0.3)",
+        takes_value: true,
+    },
+    OptionSpec {
+        key: "assets",
+        help: "Supertonic assets directory",
+        takes_value: true,
+    },
 ];
 use ort::value::Tensor;
 use serde::Deserialize;
 
-pub fn register(reg: &mut Registry) {
-    reg.register(Box::new(Tts));
-}
-
-struct Tts;
+pub struct Tts;
 
 impl Transform for Tts {
     fn name(&self) -> &str {
@@ -59,7 +79,7 @@ impl Transform for Tts {
         input.read_to_string(&mut text)?;
         let text = text.trim();
         if text.is_empty() {
-            return Err("no input text".into());
+            return Err(ChordError::BadInput("no input text".to_string()).into());
         }
 
         let lang = opts.get_or("lang", "en").to_string();

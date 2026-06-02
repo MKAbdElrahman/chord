@@ -1,55 +1,17 @@
-//! chord-see — vision plug-in (`image -> text`).
+//! chord-stt-llama — `stt` (audio -> text) backed by **llama.cpp's `mtmd` audio**
+//! path, i.e. audio-LLM ASR. This is the same multimodal pipeline as `see`, but
+//! the media is audio (`MtmdBitmap::from_audio_data`) instead of an image.
 //!
-//! Backed by llama.cpp's multimodal stack (`mtmd` + CLIP) through `llama-cpp-2`.
-//! It loads a vision-language model plus its `mmproj` projector, feeds the image
-//! and a prompt through the model, and writes the model's description to stdout.
-//!
-//! Options (config or `-o`):
-//! - `model` — VLM GGUF path (default gemma-4-26B under ~/.kronk/models, or $CHORD_SEE_MODEL)
-//! - `mmproj` — multimodal projector GGUF (default: the model's sibling mmproj)
-//! - `prompt` — instruction (default "Describe this image.")
-//! - `max_tokens` (default 256), `temperature` (default 0.3), `n_ctx` (default 4096)
+//! It lets chord run recent audio-LLM speech models (Voxtral, Ultravox,
+//! Qwen-audio) that whisper.cpp can't, via the engine chord already links. Model
+//! + audio projector are GGUF, resolvable as `hf:` references.
 
 use std::io::{IsTerminal, Read, Write};
 use std::num::NonZeroU32;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Transform};
 use indicatif::{ProgressBar, ProgressStyle};
-
-const OPTS: &[OptionSpec] = &[
-    OptionSpec {
-        key: "prompt",
-        help: "instruction/question about the image",
-        takes_value: true,
-    },
-    OptionSpec {
-        key: "model",
-        help: "vision GGUF model path",
-        takes_value: true,
-    },
-    OptionSpec {
-        key: "mmproj",
-        help: "multimodal projector GGUF path",
-        takes_value: true,
-    },
-    OptionSpec {
-        key: "max_tokens",
-        help: "max reply tokens (default 256)",
-        takes_value: true,
-    },
-    OptionSpec {
-        key: "temperature",
-        help: "sampling temperature (default 0.3)",
-        takes_value: true,
-    },
-    OptionSpec {
-        key: "n_ctx",
-        help: "context window tokens (default 4096)",
-        takes_value: true,
-    },
-];
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -60,47 +22,97 @@ use llama_cpp_2::openai::OpenAIChatTemplateParams;
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::{send_logs_to_tracing, LogOptions};
 
-pub struct See;
+// Default model: Mistral's Voxtral-Mini-3B (audio LLM) + its audio projector.
+const DEFAULT_MODEL: &str =
+    "hf:ggml-org/Voxtral-Mini-3B-2507-GGUF:Voxtral-Mini-3B-2507-Q4_K_M.gguf";
+const DEFAULT_MMPROJ: &str =
+    "hf:ggml-org/Voxtral-Mini-3B-2507-GGUF:mmproj-Voxtral-Mini-3B-2507-Q8_0.gguf";
 
-impl Transform for See {
+const OPTS: &[OptionSpec] = &[
+    OptionSpec {
+        key: "model",
+        help: "audio-LLM GGUF (path or hf: ref)",
+        takes_value: true,
+    },
+    OptionSpec {
+        key: "mmproj",
+        help: "audio projector GGUF (path or hf: ref)",
+        takes_value: true,
+    },
+    OptionSpec {
+        key: "prompt",
+        help: "instruction (default: transcribe verbatim)",
+        takes_value: true,
+    },
+    OptionSpec {
+        key: "max_tokens",
+        help: "max output tokens (default 448)",
+        takes_value: true,
+    },
+    OptionSpec {
+        key: "temperature",
+        help: "sampling temperature; 0 = greedy (default 0)",
+        takes_value: true,
+    },
+    OptionSpec {
+        key: "n_ctx",
+        help: "context window tokens (default 4096)",
+        takes_value: true,
+    },
+    OptionSpec {
+        key: "threads",
+        help: "CPU threads (default 4)",
+        takes_value: true,
+    },
+];
+
+pub struct SttLlama;
+
+impl Transform for SttLlama {
     fn name(&self) -> &str {
-        "see"
+        "stt"
     }
     fn from(&self) -> Kind {
-        Kind::Image
+        Kind::Audio
     }
     fn to(&self) -> Kind {
         Kind::Text
     }
     fn describe(&self) -> &str {
-        "vision: describe/read an image (llama.cpp mtmd)"
+        "speech-to-text via audio-LLM (llama.cpp mtmd)"
+    }
+    fn backend(&self) -> &str {
+        "llama.cpp"
     }
     fn options(&self) -> &'static [OptionSpec] {
         OPTS
     }
 
     fn apply(&self, input: &mut dyn Read, output: &mut dyn Write, opts: &Options) -> Result<()> {
-        // Silence llama/ggml logs AND the CLIP/mtmd logger (separate channel —
-        // it has its own callback, so send_logs_to_tracing alone misses the
-        // "clip_model_loader: tensor[...]" dump). The spinner still draws.
         send_logs_to_tracing(LogOptions::default().with_logs_enabled(false));
-        // mtmd_helper_log_set silences the mtmd-helper logger (image encode/decode
-        // progress) AND calls mtmd_log_set internally (the CLIP loader dump).
         unsafe {
             llama_cpp_sys_2::mtmd_helper_log_set(Some(silent_mtmd_log), std::ptr::null_mut())
         };
 
-        let (model_path, mmproj_path) = resolve_models(opts)?;
-        let prompt = opts.get_or("prompt", "Describe this image.").to_string();
-        let max_tokens: i32 = opts.get_or("max_tokens", "256").parse().unwrap_or(256);
-        let temperature: f32 = opts.get_or("temperature", "0.3").parse().unwrap_or(0.3);
+        let model_path = chord_hf::resolve(opts.get_or("model", DEFAULT_MODEL))?;
+        let mmproj_path = chord_hf::resolve(opts.get_or("mmproj", DEFAULT_MMPROJ))?;
+        let prompt = opts
+            .get_or(
+                "prompt",
+                "Transcribe the audio verbatim, with no extra commentary.",
+            )
+            .to_string();
+        let max_tokens: i32 = opts.get_or("max_tokens", "448").parse().unwrap_or(448);
+        let temperature: f32 = opts.get_or("temperature", "0").parse().unwrap_or(0.0);
         let n_ctx: u32 = opts.get_or("n_ctx", "4096").parse().unwrap_or(4096);
+        let threads: i32 = opts.get_or("threads", "4").parse().unwrap_or(4);
 
-        let mut image_bytes = Vec::new();
-        input.read_to_end(&mut image_bytes)?;
-        if image_bytes.is_empty() {
-            return Err(ChordError::BadInput("no image on input".to_string()).into());
+        let mut wav = Vec::new();
+        input.read_to_end(&mut wav)?;
+        if wav.is_empty() {
+            return Err(ChordError::BadInput("no audio on input".to_string()).into());
         }
+        let (samples, src_rate) = decode_wav_to_mono_f32(&wav)?;
 
         let pb = spinner(&format!(
             "loading {}…",
@@ -117,11 +129,10 @@ impl Transform for See {
             &LlamaModelParams::default().with_n_gpu_layers(0),
         )?;
 
-        // Multimodal context (CLIP projector + text model).
         let mtmd_params = MtmdContextParams {
             use_gpu: false,
             print_timings: false,
-            n_threads: opts.get_or("threads", "4").parse().unwrap_or(4),
+            n_threads: threads,
             ..Default::default()
         };
         let marker = mtmd_params
@@ -134,14 +145,15 @@ impl Transform for See {
             &model,
             &mtmd_params,
         )?;
-        if !mtmd_ctx.support_vision() {
-            return Err("model/mmproj does not support vision input".into());
+        if !mtmd_ctx.support_audio() {
+            return Err("model/mmproj does not support audio input".into());
         }
 
-        let bitmap = MtmdBitmap::from_buffer(&mtmd_ctx, &image_bytes)?;
+        // Resample to the rate the audio encoder expects (usually 16 kHz).
+        let target_rate = mtmd_ctx.get_audio_sample_rate().unwrap_or(16_000);
+        let samples = resample_linear(&samples, src_rate, target_rate);
+        let bitmap = MtmdBitmap::from_audio_data(&samples)?;
 
-        // Render the chat prompt with the media marker in the user turn, then
-        // let mtmd tokenize text + image into chunks.
         let user = format!("{marker}\n{prompt}");
         let messages_json =
             serde_json::Value::Array(vec![serde_json::json!({"role":"user","content":user})])
@@ -180,11 +192,9 @@ impl Transform for See {
             LlamaContextParams::default().with_n_ctx(Some(NonZeroU32::new(n_ctx).unwrap()));
         let mut ctx = model.new_context(&backend, ctx_params)?;
 
-        pb.set_message("encoding image…");
-        // Evaluate text+image chunks into the context; logits on the last token.
+        pb.set_message("encoding audio…");
         let n_past = chunks.eval_chunks(&mtmd_ctx, &ctx, 0, 0, 512, true)?;
 
-        // Generate the description.
         let mut sampler = if temperature <= 0.0 {
             LlamaSampler::greedy()
         } else {
@@ -202,7 +212,7 @@ impl Transform for See {
         let mut n_cur = n_past;
         let mut produced = 0;
 
-        pb.set_message("describing…");
+        pb.set_message("transcribing…");
         let mut token = sampler.sample(&ctx, -1);
         while produced < max_tokens {
             sampler.accept(token);
@@ -225,48 +235,54 @@ impl Transform for See {
     }
 }
 
-/// Resolve (model, mmproj) GGUF paths. Defaults to gemma-4-26B + its sibling
-/// mmproj under ~/.kronk/models; override with `model`/`mmproj` or
-/// $CHORD_SEE_MODEL / $CHORD_SEE_MMPROJ.
-fn resolve_models(opts: &Options) -> Result<(PathBuf, PathBuf)> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let dir = PathBuf::from(&home).join(".kronk/models/unsloth/gemma-4-26B-A4B-it-GGUF");
-
-    let model = match opts
-        .get("model")
-        .map(str::to_string)
-        .or_else(|| std::env::var("CHORD_SEE_MODEL").ok())
-    {
-        Some(spec) => chord_hf::resolve(&spec)?,
-        None => dir.join("gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"),
-    };
-    let mmproj = match opts
-        .get("mmproj")
-        .map(str::to_string)
-        .or_else(|| std::env::var("CHORD_SEE_MMPROJ").ok())
-    {
-        Some(spec) => chord_hf::resolve(&spec)?,
-        None => dir.join("mmproj-gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"),
-    };
-
-    if !model.exists() {
-        return Err(ChordError::ModelMissing {
-            what: format!("vision model {}", model.display()),
-            hint: "run `chord pull see`, or set --model to a vision GGUF path".to_string(),
+/// Decode WAV bytes to mono f32, returning (samples, sample_rate).
+fn decode_wav_to_mono_f32(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
+    let mut reader = hound::WavReader::new(std::io::Cursor::new(bytes))?;
+    let spec = reader.spec();
+    let channels = spec.channels.max(1) as usize;
+    let interleaved: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<std::result::Result<_, _>>()?,
+        hound::SampleFormat::Int => {
+            let scale = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .map(|s| s.map(|v| v as f32 / scale))
+                .collect::<std::result::Result<_, _>>()?
         }
-        .into());
-    }
-    if !mmproj.exists() {
-        return Err(ChordError::ModelMissing {
-            what: format!("mmproj {}", mmproj.display()),
-            hint: "run `chord pull see`, or set --mmproj to a projector GGUF path".to_string(),
-        }
-        .into());
-    }
-    Ok((model, mmproj))
+    };
+    let mono: Vec<f32> = if channels <= 1 {
+        interleaved
+    } else {
+        interleaved
+            .chunks(channels)
+            .map(|f| f.iter().sum::<f32>() / channels as f32)
+            .collect()
+    };
+    Ok((mono, spec.sample_rate))
 }
 
-/// No-op mtmd/CLIP log callback — drops the vision-loader's stderr output.
+/// Linear-interpolation resampler (the audio encoder is robust to it).
+fn resample_linear(input: &[f32], from: u32, to: u32) -> Vec<f32> {
+    if input.is_empty() || from == to {
+        return input.to_vec();
+    }
+    let ratio = to as f64 / from as f64;
+    let out_len = ((input.len() as f64) * ratio).round() as usize;
+    let last = input.len() - 1;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let src = i as f64 / ratio;
+        let idx = src.floor() as usize;
+        let frac = (src - idx as f64) as f32;
+        let a = input[idx.min(last)];
+        let b = input[(idx + 1).min(last)];
+        out.push(a + (b - a) * frac);
+    }
+    out
+}
+
 unsafe extern "C" fn silent_mtmd_log(
     _level: llama_cpp_sys_2::ggml_log_level,
     _text: *const std::os::raw::c_char,

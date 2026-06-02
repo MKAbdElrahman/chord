@@ -1,20 +1,22 @@
 [package]
-name = "chord-chat"
-description = "chord chat plug-in (llama.cpp via llama-cpp-2): text -> text"
+name = "chord-stt-llama"
+description = "chord speech-to-text backend on llama.cpp mtmd audio (audio-LLMs: Voxtral, Ultravox, Qwen-audio)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "chord-chat"
+name = "chord-stt-llama"
 path = "src/main.rs"
 
 [dependencies]
 chord-core = { path = "../../chord-core" }
 chord-runner = { path = "../../chord-runner" }
 chord-hf = { path = "../../chord-hf" }
-llama-cpp-2 = "0.1.146"
+llama-cpp-2 = { version = "0.1.146", features = ["mtmd"] }
+llama-cpp-sys-2 = "0.1.146"
+hound = "3"
 encoding_rs = "0.8"
-indicatif = "0.18.4"
-serde_json = "1.0.150"
+serde_json = "1"
+indicatif = "0.18"

@@ -11,7 +11,9 @@ name = "chord-draw"
 path = "src/main.rs"
 
 [dependencies]
+chord-core = { path = "../../chord-core" }
 diffusion-rs = "0.1.19"
+serde_json = "1"
 clap = "4"
 indicatif = "0.18"
 libc = "0.2"

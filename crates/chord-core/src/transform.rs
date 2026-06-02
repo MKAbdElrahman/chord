@@ -68,6 +68,14 @@ pub trait Transform: Send + Sync {
     /// One-line human summary, shown by `chord ls`.
     fn describe(&self) -> &str;
 
+    /// The inference backend this transform requires (e.g. `"whisper.cpp"`,
+    /// `"llama.cpp"`, `"mistral.rs"`). Backends are modular: a transform
+    /// declares the engine it runs on, and the host routes to it. Defaults to
+    /// empty for transforms with no external engine.
+    fn backend(&self) -> &str {
+        ""
+    }
+
     /// The options this transform accepts, so the host can render them as CLI
     /// flags. Defaults to none.
     fn options(&self) -> &'static [OptionSpec] {

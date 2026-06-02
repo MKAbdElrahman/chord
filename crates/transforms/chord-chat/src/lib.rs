@@ -19,16 +19,40 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use chord_core::{Kind, OptionSpec, Options, Registry, Result, Transform};
+use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Transform};
 use indicatif::{ProgressBar, ProgressStyle};
 
 const OPTS: &[OptionSpec] = &[
-    OptionSpec { key: "model", help: "GGUF model path or name", takes_value: true },
-    OptionSpec { key: "system", help: "system prompt", takes_value: true },
-    OptionSpec { key: "think", help: "enable reasoning (default off)", takes_value: false },
-    OptionSpec { key: "max_tokens", help: "max reply tokens (default 512)", takes_value: true },
-    OptionSpec { key: "temperature", help: "sampling temperature (default 0.7)", takes_value: true },
-    OptionSpec { key: "n_ctx", help: "context window tokens (default 4096)", takes_value: true },
+    OptionSpec {
+        key: "model",
+        help: "GGUF model path or name",
+        takes_value: true,
+    },
+    OptionSpec {
+        key: "system",
+        help: "system prompt",
+        takes_value: true,
+    },
+    OptionSpec {
+        key: "think",
+        help: "enable reasoning (default off)",
+        takes_value: false,
+    },
+    OptionSpec {
+        key: "max_tokens",
+        help: "max reply tokens (default 512)",
+        takes_value: true,
+    },
+    OptionSpec {
+        key: "temperature",
+        help: "sampling temperature (default 0.7)",
+        takes_value: true,
+    },
+    OptionSpec {
+        key: "n_ctx",
+        help: "context window tokens (default 4096)",
+        takes_value: true,
+    },
 ];
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -39,11 +63,7 @@ use llama_cpp_2::openai::OpenAIChatTemplateParams;
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::{send_logs_to_tracing, LogOptions};
 
-pub fn register(reg: &mut Registry) {
-    reg.register(Box::new(Chat));
-}
-
-struct Chat;
+pub struct Chat;
 
 impl Transform for Chat {
     fn name(&self) -> &str {
@@ -67,7 +87,7 @@ impl Transform for Chat {
         input.read_to_string(&mut user)?;
         let user = user.trim();
         if user.is_empty() {
-            return Err("no input prompt".into());
+            return Err(ChordError::BadInput("no input prompt".to_string()).into());
         }
 
         // Silence llama.cpp / ggml stderr logging (model-load "repack" spam etc.).
@@ -259,11 +279,11 @@ fn spinner(msg: &str) -> ProgressBar {
 /// the Qwen3-30B-A3B GGUF under ~/.kronk/models.
 fn resolve_model(opts: &Options) -> Result<PathBuf> {
     if let Some(m) = opts.get("model") {
-        return Ok(PathBuf::from(m));
+        return chord_hf::resolve(m);
     }
     if let Ok(m) = std::env::var("CHORD_CHAT_MODEL") {
         if !m.is_empty() {
-            return Ok(PathBuf::from(m));
+            return chord_hf::resolve(&m);
         }
     }
     let home = std::env::var("HOME").unwrap_or_default();
@@ -272,5 +292,10 @@ fn resolve_model(opts: &Options) -> Result<PathBuf> {
     if default.exists() {
         return Ok(default);
     }
-    Err("no chat model: set chat.model (a GGUF path) or $CHORD_CHAT_MODEL".into())
+    Err(ChordError::ModelMissing {
+        what: "chat model".to_string(),
+        hint: "run `chord pull chat`, or set --model to a GGUF path (or $CHORD_CHAT_MODEL)"
+            .to_string(),
+    }
+    .into())
 }

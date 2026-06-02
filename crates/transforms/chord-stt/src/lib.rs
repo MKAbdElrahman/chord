@@ -14,21 +14,28 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use chord_core::{Kind, OptionSpec, Options, Registry, Result, Transform};
+use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Transform};
 
 const OPTS: &[OptionSpec] = &[
-    OptionSpec { key: "model", help: "whisper model path or name (default large-v3-turbo)", takes_value: true },
-    OptionSpec { key: "lang", help: "language code, e.g. en, de (default auto)", takes_value: true },
-    OptionSpec { key: "threads", help: "CPU threads (default 4)", takes_value: true },
+    OptionSpec {
+        key: "model",
+        help: "whisper model path or name (default large-v3-turbo)",
+        takes_value: true,
+    },
+    OptionSpec {
+        key: "lang",
+        help: "language code, e.g. en, de (default auto)",
+        takes_value: true,
+    },
+    OptionSpec {
+        key: "threads",
+        help: "CPU threads (default 4)",
+        takes_value: true,
+    },
 ];
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-/// Register the stt plug-in into `reg`.
-pub fn register(reg: &mut Registry) {
-    reg.register(Box::new(Stt));
-}
-
-struct Stt;
+pub struct Stt;
 
 impl Transform for Stt {
     fn name(&self) -> &str {
@@ -95,6 +102,10 @@ fn resolve_model(opts: &Options) -> Result<PathBuf> {
         .or_else(|| std::env::var("CHORD_STT_MODEL").ok())
         .unwrap_or_else(|| "large-v3-turbo".to_string());
 
+    if chord_hf::is_hf(&spec) {
+        return chord_hf::resolve(&spec);
+    }
+
     let direct = Path::new(&spec);
     if direct.exists() {
         return Ok(direct.to_path_buf());
@@ -108,10 +119,10 @@ fn resolve_model(opts: &Options) -> Result<PathBuf> {
         return Ok(candidate);
     }
 
-    Err(format!(
-        "whisper model {spec:?} not found (looked for that path and {})",
-        candidate.display()
-    )
+    Err(ChordError::ModelMissing {
+        what: format!("whisper model {spec:?} (looked at {})", candidate.display()),
+        hint: "run `chord pull stt`, or set --model to a ggml model path".to_string(),
+    }
     .into())
 }
 

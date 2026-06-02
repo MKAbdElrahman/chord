@@ -2,8 +2,15 @@
 resolver = "2"
 members = [
     "crates/chord-core",
+    "crates/chord-runner",
+    "crates/chord-hf",
     "crates/chord-cli",
     "crates/transforms/chord-stt",
+    "crates/transforms/chord-stt-llama",
+    "crates/transforms/chord-stt-sherpa",
+    "crates/transforms/chord-diarize",
+    "crates/transforms/chord-vad",
+    "crates/transforms/chord-langid",
     "crates/transforms/chord-tts",
     "crates/transforms/chord-chat",
     "crates/transforms/chord-see",
@@ -14,4 +21,4 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/mabdelrahman-ai/chord"
+repository = "https://github.com/MKAbdElrahman/chord"

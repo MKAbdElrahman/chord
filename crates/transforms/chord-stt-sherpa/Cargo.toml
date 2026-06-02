@@ -1,20 +1,18 @@
 [package]
-name = "chord-tts"
-description = "chord text-to-speech plug-in (Supertonic via ONNX Runtime): text -> audio"
+name = "chord-stt-sherpa"
+description = "chord speech-to-text backend on sherpa-onnx (NeMo transducer: Parakeet-TDT multilingual SOTA)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "chord-tts"
+name = "chord-stt-sherpa"
 path = "src/main.rs"
 
 [dependencies]
 chord-core = { path = "../../chord-core" }
 chord-runner = { path = "../../chord-runner" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+chord-hf = { path = "../../chord-hf" }
+sherpa-rs = "0.6"
 hound = "3"
-unicode-normalization = "0.1"
-ort = "2.0.0-rc.12"

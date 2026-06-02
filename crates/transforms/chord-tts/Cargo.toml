@@ -1,0 +1,15 @@
+[package]
+name = "chord-tts"
+description = "chord text-to-speech plug-in (Supertonic via ONNX Runtime): text -> audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chord-core = { path = "../../chord-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hound = "3"
+unicode-normalization = "0.1"
+ort = "2.0.0-rc.12"

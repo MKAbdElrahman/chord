@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/chord-core",
+    "crates/chord-cli",
+    "crates/transforms/chord-stt",
+    "crates/transforms/chord-tts",
+    "crates/transforms/chord-chat",
+    "crates/transforms/chord-see",
+    "crates/transforms/chord-draw",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/mabdelrahman-ai/chord"

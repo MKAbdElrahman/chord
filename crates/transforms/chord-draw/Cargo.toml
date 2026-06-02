@@ -1,0 +1,17 @@
+[package]
+name = "chord-draw"
+description = "chord image-generation engine (stable-diffusion.cpp): stdin prompt -> PNG on stdout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "chord-draw"
+path = "src/main.rs"
+
+[dependencies]
+diffusion-rs = "0.1.19"
+clap = "4"
+indicatif = "0.18"
+libc = "0.2"

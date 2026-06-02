@@ -1,0 +1,10 @@
+[package]
+name = "chord-core"
+description = "chord microkernel: data kinds, the Transform plug-in contract, and a registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The kernel has NO dependencies — standard library only (the dependency rule).
+[dependencies]

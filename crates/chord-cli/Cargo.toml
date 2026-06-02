@@ -1,0 +1,21 @@
+[package]
+name = "chord-cli"
+description = "chord CLI host and composition root"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "chord"
+path = "src/main.rs"
+
+[dependencies]
+chord-core = { path = "../chord-core" }
+chord-stt = { path = "../transforms/chord-stt" }
+chord-tts = { path = "../transforms/chord-tts" }
+chord-chat = { path = "../transforms/chord-chat" }
+chord-see = { path = "../transforms/chord-see" }
+clap = "4"
+serde = "1"
+serde_yaml_ng = "0.10"

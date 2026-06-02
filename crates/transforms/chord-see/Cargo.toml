@@ -1,0 +1,15 @@
+[package]
+name = "chord-see"
+description = "chord vision plug-in (llama.cpp mtmd): image -> text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chord-core = { path = "../../chord-core" }
+llama-cpp-2 = { version = "0.1.146", features = ["mtmd"] }
+llama-cpp-sys-2 = "0.1.146"
+encoding_rs = "0.8"
+serde_json = "1"
+indicatif = "0.18"

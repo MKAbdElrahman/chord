@@ -1,0 +1,15 @@
+[package]
+name = "chord-stt"
+description = "chord speech-to-text plug-in (whisper.cpp via whisper-rs): audio -> text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chord-core = { path = "../../chord-core" }
+# whisper-rs: Rust bindings to whisper.cpp (tazz4843, Codeberg upstream).
+# Compiles whisper.cpp from a git submodule at build time (needs cmake + cc).
+whisper-rs = { git = "https://codeberg.org/tazz4843/whisper-rs" }
+# WAV decoding; resampling to 16 kHz mono is done in-crate.
+hound = "3"

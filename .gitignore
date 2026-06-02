@@ -1,6 +1,19 @@
 # Rust build artifacts
 /target
+**/*.rs.bk
+*.pdb
 
-# Editor / OS noise
+# Editor / IDE
 *.swp
+*.swo
+.idea/
+.vscode/
+
+# OS noise
 .DS_Store
+Thumbs.db
+
+# Local config / secrets
+chord.yaml
+.env
+.env.*

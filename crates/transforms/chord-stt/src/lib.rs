@@ -11,7 +11,7 @@
 //!   - `lang`  — language code (e.g. `en`, `de`); omitted = whisper default.
 //!   - `threads` — CPU threads (default 4).
 
-use std::io::{Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
 use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Transform};
@@ -71,34 +71,92 @@ impl Transform for Stt {
             WhisperContextParameters::default(),
         )?;
 
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         let threads: i32 = opts.get_or("threads", "4").parse().unwrap_or(4);
-        params.set_n_threads(threads);
-        params.set_print_progress(false);
-        params.set_print_realtime(false);
-        params.set_print_timestamps(false);
-        if let Some(lang) = opts.get("lang") {
-            params.set_language(Some(lang));
-        }
-
-        let mut state = ctx.create_state()?;
-        state.full(params, &samples)?;
-
-        let mut text = String::new();
-        for segment in state.as_iter() {
-            text.push_str(&segment.to_string());
-        }
+        let text = transcribe_one(&ctx, &samples, opts.get("lang"), threads)?;
         writeln!(output, "{}", text.trim())?;
         Ok(())
     }
 }
 
+/// Transcribe one clip with an already-loaded context (the model load is the
+/// expensive part, so batch callers load `ctx` once and reuse it).
+fn transcribe_one(
+    ctx: &WhisperContext,
+    samples: &[f32],
+    lang: Option<&str>,
+    threads: i32,
+) -> Result<String> {
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_n_threads(threads);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    if let Some(l) = lang {
+        params.set_language(Some(l));
+    }
+    let mut state = ctx.create_state()?;
+    state.full(params, samples)?;
+    let mut text = String::new();
+    for segment in state.as_iter() {
+        text.push_str(&segment.to_string());
+    }
+    Ok(text)
+}
+
+/// `chord-stt --batch`: load the whisper model ONCE, then transcribe a list of
+/// files read from stdin (one `path` or `path<TAB>lang` per line), printing one
+/// transcript line per input (in order). This removes the per-call model-load
+/// cost that dominates per-segment pipelines.
+pub fn run_batch(args: &[String]) -> Result<()> {
+    whisper_rs::install_logging_hooks();
+    let model = resolve_model_spec(arg_val(args, "--model"))?;
+    let default_lang = arg_val(args, "--lang");
+    let threads: i32 = arg_val(args, "--threads")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+
+    let ctx = WhisperContext::new_with_params(
+        model.to_str().ok_or("model path is not valid UTF-8")?,
+        WhisperContextParameters::default(),
+    )?;
+
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut it = line.splitn(2, '\t');
+        let path = it.next().unwrap_or("").trim();
+        let lang = it
+            .next()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| default_lang.clone());
+        let bytes = std::fs::read(path)?;
+        let samples = decode_wav_to_16k_mono(&bytes)?;
+        let text = transcribe_one(&ctx, &samples, lang.as_deref(), threads)?;
+        writeln!(out, "{}", text.replace('\n', " ").trim())?;
+    }
+    Ok(())
+}
+
+/// Tiny `--flag value` lookup for the batch entrypoint (it doesn't use clap).
+fn arg_val(args: &[String], flag: &str) -> Option<String> {
+    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1).cloned())
+}
+
 /// Resolve the model: an existing path is used as-is; otherwise the value is a
 /// short catalog name resolved to `~/models/ggml-<name>.bin`.
 fn resolve_model(opts: &Options) -> Result<PathBuf> {
-    let spec = opts
-        .get("model")
-        .map(str::to_string)
+    resolve_model_spec(opts.get("model").map(str::to_string))
+}
+
+/// Resolve a model spec (None -> $CHORD_STT_MODEL -> default) to a file path.
+fn resolve_model_spec(spec: Option<String>) -> Result<PathBuf> {
+    let spec = spec
         .or_else(|| std::env::var("CHORD_STT_MODEL").ok())
         .unwrap_or_else(|| "large-v3-turbo".to_string());
 

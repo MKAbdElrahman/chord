@@ -105,13 +105,27 @@ fn pull_default(transform: &str) -> Result<()> {
             eprintln!("draw downloads its model automatically on first use — just run `chord draw \"…\"`.");
             Ok(())
         }
+        "redact" => {
+            // openai/privacy-filter is multi-file: the ONNX graph, its external
+            // weights, the tokenizer, and the config — all from the same repo.
+            for spec in [
+                "hf:openai/privacy-filter:onnx/model_q4f16.onnx",
+                "hf:openai/privacy-filter:onnx/model_q4f16.onnx_data",
+                "hf:openai/privacy-filter:tokenizer.json",
+                "hf:openai/privacy-filter:config.json",
+            ] {
+                let path = chord_hf::download(spec)?;
+                eprintln!("ready: {}", path.display());
+            }
+            Ok(())
+        }
         "chat" | "see" | "tts" => Err(ChordError::Engine(format!(
             "no built-in download for `{transform}`: point it at a local model \
              (chat/see: --model <GGUF> or config; tts: --assets <dir>)"
         ))
         .into()),
         other => Err(ChordError::BadInput(format!(
-            "unknown transform {other:?} (try: stt, tts, chat, see, draw)"
+            "unknown transform {other:?} (try: stt, tts, chat, see, draw, redact)"
         ))
         .into()),
     }

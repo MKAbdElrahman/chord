@@ -1,0 +1,18 @@
+[package]
+name = "chord-redact"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "chord-redact"
+path = "src/main.rs"
+
+[dependencies]
+chord-core = { path = "../../chord-core" }
+chord-runner = { path = "../../chord-runner" }
+chord-hf = { path = "../../chord-hf" }
+serde_json = "1"
+ort = "2.0.0-rc.12"
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }

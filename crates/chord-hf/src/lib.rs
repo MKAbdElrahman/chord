@@ -44,9 +44,11 @@ fn parse(spec: &str) -> Result<HfRef> {
         .strip_prefix("hf:")
         .ok_or_else(|| ChordError::BadInput(format!("not an hf: reference: {spec}")))?;
 
-    // The selector is the segment after the last ':' (the repo id has no ':').
-    let (repo_part, selector) = match rest.rsplit_once(':') {
-        Some((r, sel)) if !sel.is_empty() && !sel.contains('/') => (r, Some(sel.to_string())),
+    // The selector follows the first ':' (the repo id never contains one). The
+    // selector itself may contain '/' for files in a subdir (e.g.
+    // `onnx/model_quantized.onnx`).
+    let (repo_part, selector) = match rest.split_once(':') {
+        Some((r, sel)) if !sel.is_empty() => (r, Some(sel.to_string())),
         _ => (rest, None),
     };
     // Optional `@revision`.

@@ -33,6 +33,7 @@ fn build_registry() -> Registry {
     reg.register(Box::new(proxy::ExecProxy::diarize()));
     reg.register(Box::new(proxy::ExecProxy::vad()));
     reg.register(Box::new(proxy::ExecProxy::langid()));
+    reg.register(Box::new(proxy::ExecProxy::redact()));
     reg
 }
 

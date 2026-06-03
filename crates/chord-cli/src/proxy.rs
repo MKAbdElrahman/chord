@@ -283,6 +283,12 @@ const LANGID_OPTS: &[OptionSpec] = &[
     },
 ];
 
+const REDACT_OPTS: &[OptionSpec] = &[OptionSpec {
+    key: "model",
+    help: "PII model: .onnx path or hf: ref (default openai/privacy-filter q4f16)",
+    takes_value: true,
+}];
+
 const DRAW_OPTS: &[OptionSpec] = &[
     OptionSpec {
         key: "model",
@@ -413,6 +419,18 @@ impl ExecProxy {
             backend: "sherpa-onnx",
             bin: "chord-diarize",
             opts: DIARIZE_OPTS,
+        }
+    }
+    /// Privacy filter (text -> text): detect & redact PII via ONNX Runtime.
+    pub fn redact() -> Self {
+        ExecProxy {
+            name: "redact",
+            from: Kind::Text,
+            to: Kind::Text,
+            describe: "privacy filter: detect & redact PII (openai/privacy-filter)",
+            backend: "onnxruntime",
+            bin: "chord-redact",
+            opts: REDACT_OPTS,
         }
     }
     /// Alternate `stt` backend: NeMo transducer (Parakeet) via sherpa-onnx.

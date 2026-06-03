@@ -11,6 +11,7 @@ members = [
     "crates/transforms/chord-diarize",
     "crates/transforms/chord-vad",
     "crates/transforms/chord-langid",
+    "crates/transforms/chord-redact",
     "crates/transforms/chord-tts",
     "crates/transforms/chord-chat",
     "crates/transforms/chord-see",

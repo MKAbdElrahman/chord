@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build, test, lint (kernel + host + light transforms)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # chord's engine plug-ins link heavy native libraries (llama.cpp,
+      # whisper.cpp, ONNX Runtime, sherpa-onnx, stable-diffusion.cpp), and the
+      # multimodal `chat` engine path-deps an out-of-tree mistral.rs checkout.
+      # CI validates the pure-Rust kernel, host, and light transforms (core,
+      # runner, hf, cli, pack, unpack); drop chord-chat from the workspace so
+      # resolution doesn't require the sibling mistral.rs repo. The native
+      # engines are built per-machine (see the README install steps).
+      - name: Trim workspace to CI-buildable crates
+        run: sed -i '\#"crates/transforms/chord-chat",#d' Cargo.toml
+
+      - name: Install Rust (stable + rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: >
+          cargo fmt
+          -p chord-core -p chord-runner -p chord-hf
+          -p chord-cli -p chord-pack -p chord-unpack
+          -- --check
+
+      - name: Clippy
+        run: >
+          cargo clippy
+          -p chord-core -p chord-runner -p chord-hf
+          -p chord-cli -p chord-pack -p chord-unpack
+          -- -D warnings
+
+      - name: Build
+        run: >
+          cargo build --verbose
+          -p chord-core -p chord-runner -p chord-hf
+          -p chord-cli -p chord-pack -p chord-unpack
+
+      - name: Test
+        run: cargo test --verbose -p chord-core -p chord-pack -p chord-unpack

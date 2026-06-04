@@ -13,7 +13,10 @@
 use chord_core::{
     ChordError, Kind, Message, OptionSpec, Options, Part, Result, Signature, Transform,
 };
-use mistralrs::{AudioInput, IsqBits, ModelBuilder, MultimodalMessages, TextMessageRole};
+use mistralrs::{
+    AudioInput, IsqBits, ModelBuilder, MultimodalMessages, PagedAttentionMetaBuilder,
+    TextMessageRole,
+};
 
 /// Default model: Gemma 4 E4B, the small multimodal (text+image+audio) model.
 /// Override with `--model <hf-id-or-path>`.
@@ -45,6 +48,16 @@ const OPTS: &[OptionSpec] = &[
         help: "enable reasoning/thinking (default off)",
         takes_value: false,
     },
+    OptionSpec {
+        key: "mtp_model",
+        help: "MTP assistant model (HF id or path) for speculative decoding; requires PagedAttention (GPU)",
+        takes_value: true,
+    },
+    OptionSpec {
+        key: "mtp_n_predict",
+        help: "tokens the MTP assistant proposes per step (default: assistant config, else 6)",
+        takes_value: true,
+    },
 ];
 
 pub struct Chat;
@@ -55,10 +68,7 @@ impl Transform for Chat {
     }
 
     fn signature(&self) -> Signature {
-        Signature::new(
-            vec![Kind::Text, Kind::Image, Kind::Audio],
-            vec![Kind::Text],
-        )
+        Signature::new(vec![Kind::Text, Kind::Image, Kind::Audio], vec![Kind::Text])
     }
 
     fn describe(&self) -> &str {
@@ -120,10 +130,21 @@ impl Transform for Chat {
         let model_id = opts.get("model").unwrap_or(DEFAULT_MODEL).to_string();
         let system = opts.get("system").map(str::to_string);
         let think = opts.get("think").is_some();
+        // Optional MTP (multi-token-prediction) speculative decoding drafter.
+        let mtp = opts.get("mtp_model").map(|m| Mtp {
+            model: m.to_string(),
+            n_predict: opts.get("mtp_n_predict").and_then(|s| s.parse().ok()),
+        });
 
-        let reply = run(model_id, system, text, images, audios, think)?;
+        let reply = run(model_id, system, text, images, audios, think, mtp)?;
         Ok(Message::one(Part::text(reply)))
     }
+}
+
+/// An MTP (multi-token-prediction) speculative-decoding drafter.
+struct Mtp {
+    model: String,
+    n_predict: Option<usize>,
 }
 
 /// Run one multimodal turn synchronously (block on a private tokio runtime).
@@ -134,6 +155,7 @@ fn run(
     images: Vec<image::DynamicImage>,
     audios: Vec<AudioInput>,
     think: bool,
+    mtp: Option<Mtp>,
 ) -> Result<String> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -141,8 +163,18 @@ fn run(
         .map_err(|e| ChordError::Engine(format!("tokio runtime: {e}")))?;
 
     rt.block_on(async move {
-        let model = ModelBuilder::new(&model_id)
-            .with_auto_isq(IsqBits::Four)
+        let mut builder = ModelBuilder::new(&model_id).with_auto_isq(IsqBits::Four);
+        // MTP speculative decoding: a drafter proposes several tokens that the
+        // target verifies. It requires PagedAttention on the target, so enable
+        // that alongside it (only when MTP is requested).
+        if let Some(mtp) = mtp {
+            builder = builder
+                .with_mtp_model(mtp.model, mtp.n_predict)
+                .with_paged_attn(PagedAttentionMetaBuilder::default().build().map_err(|e| {
+                    ChordError::Engine(format!("paged attention (required for MTP): {e}"))
+                })?);
+        }
+        let model = builder
             .build()
             .await
             .map_err(|e| ChordError::Engine(format!("loading model {model_id}: {e}")))?;

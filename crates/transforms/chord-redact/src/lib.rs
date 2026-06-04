@@ -46,6 +46,9 @@ impl Transform for Redact {
     fn describe(&self) -> &str {
         "privacy filter: detect & redact PII (openai/privacy-filter)"
     }
+    fn backend(&self) -> &str {
+        "onnxruntime"
+    }
     fn options(&self) -> &'static [OptionSpec] {
         OPTS
     }

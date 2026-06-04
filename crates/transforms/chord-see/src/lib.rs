@@ -5,7 +5,7 @@
 //! and a prompt through the model, and writes the model's description to stdout.
 //!
 //! Options (config or `-o`):
-//! - `model` — VLM GGUF path (default gemma-4-26B under ~/.kronk/models, or $CHORD_SEE_MODEL)
+//! - `model` — VLM GGUF path (default gemma-4-26B under the XDG models dir, or $CHORD_SEE_MODEL)
 //! - `mmproj` — multimodal projector GGUF (default: the model's sibling mmproj)
 //! - `prompt` — instruction (default "Describe this image.")
 //! - `max_tokens` (default 256), `temperature` (default 0.3), `n_ctx` (default 4096)
@@ -74,6 +74,9 @@ impl Transform for See {
     }
     fn describe(&self) -> &str {
         "vision: describe/read an image (llama.cpp mtmd)"
+    }
+    fn backend(&self) -> &str {
+        "llama.cpp"
     }
     fn options(&self) -> &'static [OptionSpec] {
         OPTS
@@ -226,11 +229,10 @@ impl Transform for See {
 }
 
 /// Resolve (model, mmproj) GGUF paths. Defaults to gemma-4-26B + its sibling
-/// mmproj under ~/.kronk/models; override with `model`/`mmproj` or
+/// mmproj under the XDG models dir; override with `model`/`mmproj` or
 /// $CHORD_SEE_MODEL / $CHORD_SEE_MMPROJ.
 fn resolve_models(opts: &Options) -> Result<(PathBuf, PathBuf)> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let dir = PathBuf::from(&home).join(".kronk/models/unsloth/gemma-4-26B-A4B-it-GGUF");
+    let dir = chord_core::dirs::models_dir().join("unsloth/gemma-4-26B-A4B-it-GGUF");
 
     let model = match opts
         .get("model")

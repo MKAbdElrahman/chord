@@ -12,12 +12,8 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 
-use chord_core::{ChordError, Options, Result, Transform};
+use chord_core::{dirs, ChordError, Options, Result, Transform};
 use indicatif::{ProgressBar, ProgressStyle};
-
-fn home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default())
-}
 
 /// Make every `hf:` model option a transform needs present before it runs.
 ///
@@ -98,7 +94,7 @@ fn pull_default(transform: &str) -> Result<()> {
     match transform {
         "stt" => download(
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
-            home().join("models").join("ggml-large-v3-turbo.bin"),
+            dirs::models_dir().join("ggml-large-v3-turbo.bin"),
             "whisper large-v3-turbo (~1.5 GB)",
         ),
         "draw" => {

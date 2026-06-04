@@ -6,34 +6,30 @@
 //! pipe's job: `cat q.wav | chord stt | chord chat | chord tts > a.wav`.
 
 mod config;
+mod discover;
 mod proxy;
 mod pull;
 
 use std::fs::File;
-use std::io::{self, Read};
-use std::process::exit;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::process::{exit, Child, ChildStdout, Stdio};
 
-use chord_core::{Kind, Registry, Result, Transform};
+use chord_core::{ChordError, Kind, Registry, Result, Transform};
 use clap::{Arg, ArgAction, ArgMatches, Command};
 
 use config::Config;
 
 /// Build the registry — the composition root. Every engine runs out-of-process:
-/// it ships as its own `chord-<name>` binary and is registered here as an
-/// exec-proxy. The `chord` binary therefore links no engine code (which also
-/// sidesteps native-library symbol clashes, e.g. the two copies of ggml). See
-/// proxy.rs.
+/// it ships as its own `chord-<name>` binary, *discovered* on disk and described
+/// by its own `--chord-manifest` (see `discover.rs`). The host hardcodes no
+/// engine list and links no engine code (which also sidesteps native-library
+/// symbol clashes, e.g. the two copies of ggml). See proxy.rs.
 fn build_registry() -> Registry {
     let mut reg = Registry::new();
-    reg.register(Box::new(proxy::ExecProxy::stt()));
-    reg.register(Box::new(proxy::ExecProxy::tts()));
-    reg.register(Box::new(proxy::ExecProxy::chat()));
-    reg.register(Box::new(proxy::ExecProxy::see()));
-    reg.register(Box::new(proxy::ExecProxy::draw()));
-    reg.register(Box::new(proxy::ExecProxy::diarize()));
-    reg.register(Box::new(proxy::ExecProxy::vad()));
-    reg.register(Box::new(proxy::ExecProxy::langid()));
-    reg.register(Box::new(proxy::ExecProxy::redact()));
+    for proxy in proxy::default_proxies() {
+        reg.register(Box::new(proxy));
+    }
     reg
 }
 
@@ -63,7 +59,7 @@ fn main() {
             Ok(())
         }
         Some(("pull", sub)) => pull::run(sub),
-        Some(("pipeline", sub)) => run_pipeline(&reg, sub, &config),
+        Some(("pipeline", sub)) => run_pipeline(sub, &config),
         Some((name, sub)) => match sub.get_one::<String>("backend").map(String::as_str) {
             // An explicit --backend: use an alternate engine if one exists, else
             // the default if it already is that backend.
@@ -274,11 +270,13 @@ fn run_filter(t: &dyn Transform, m: &ArgMatches, config: &Config) -> Result<()> 
     }
 }
 
-/// Run a multi-stage pipeline in one process. Stages are separated by `::`;
-/// each stage is `transform [flags…]`. The first stage reads its file arg or
-/// stdin; each later stage reads the previous stage's output; the last writes
-/// stdout.
-fn run_pipeline(reg: &Registry, m: &ArgMatches, config: &Config) -> Result<()> {
+/// Run a multi-stage pipeline as a true streaming chain. Stages are separated by
+/// `::`; each stage is `transform [flags…]`. Every stage's engine process is
+/// spawned at once and wired with OS pipes (stage N's stdout *is* stage N+1's
+/// stdin), so bytes flow kernel-to-kernel and the stages run concurrently —
+/// exactly like a shell `a | b | c`. The first stage reads its file arg, literal
+/// text, or our stdin; the last writes our stdout.
+fn run_pipeline(m: &ArgMatches, config: &Config) -> Result<()> {
     let tokens: Vec<String> = m
         .get_many::<String>("stages")
         .map(|v| v.cloned().collect())
@@ -299,8 +297,8 @@ fn run_pipeline(reg: &Registry, m: &ArgMatches, config: &Config) -> Result<()> {
         return Err("pipeline: empty stage (check the '::' separators)".into());
     }
 
-    struct Stage<'a> {
-        t: &'a dyn Transform,
+    struct Stage {
+        proxy: proxy::ExecProxy,
         opts: chord_core::Options,
         input: Option<String>,
     }
@@ -308,61 +306,133 @@ fn run_pipeline(reg: &Registry, m: &ArgMatches, config: &Config) -> Result<()> {
     let mut plan: Vec<Stage> = Vec::with_capacity(stages.len());
     for stage in &stages {
         let name = stage[0].as_str();
-        let t = reg
-            .get(name)
+        let p = proxy::resolve(name)
             .ok_or_else(|| format!("pipeline: unknown transform {name:?}"))?;
         let argv = std::iter::once(name.to_string()).chain(stage[1..].iter().cloned());
-        let matches = transform_command(t)
+        let matches = transform_command(&p)
             .try_get_matches_from(argv)
             .map_err(|e| format!("pipeline stage {name:?}: {e}"))?;
-        let opts = opts_from(t, &matches, config);
+        let opts = opts_from(&p, &matches, config);
         let input = matches.get_one::<String>("input").cloned();
-        plan.push(Stage { t, opts, input });
+        plan.push(Stage {
+            proxy: p,
+            opts,
+            input,
+        });
     }
 
     // Make sure every stage's models are present before the chain starts, so a
     // missing download is resolved up front (one prompt) rather than mid-run.
     for stage in &plan {
-        pull::ensure(stage.t, &stage.opts)?;
+        pull::ensure(&stage.proxy, &stage.opts)?;
     }
 
-    // Initial input: the first stage's file arg (or literal text for a
-    // text-input first stage), else stdin.
-    let mut data: Vec<u8> = Vec::new();
-    match plan[0].input.as_deref() {
+    // Resolve the first stage's input source: a file arg, literal text (for a
+    // text-input first stage), or our stdin.
+    enum FirstInput {
+        Stdin,
+        File(PathBuf),
+        Literal(Vec<u8>),
+    }
+    let first_input = match plan[0].input.as_deref() {
         Some(arg) if arg != "-" => {
-            if std::path::Path::new(arg).is_file() {
-                data = std::fs::read(arg)?;
-            } else if plan[0].t.from() == Kind::Text {
-                data = arg.as_bytes().to_vec();
+            if Path::new(arg).is_file() {
+                FirstInput::File(PathBuf::from(arg))
+            } else if plan[0].proxy.from() == Kind::Text {
+                FirstInput::Literal(arg.as_bytes().to_vec())
             } else {
-                return Err(chord_core::ChordError::BadInput(format!(
-                    "input file not found: {arg:?}"
-                ))
-                .into());
+                return Err(
+                    ChordError::BadInput(format!("input file not found: {arg:?}")).into(),
+                );
             }
         }
-        _ => {
-            io::stdin().lock().read_to_end(&mut data)?;
+        _ => FirstInput::Stdin,
+    };
+
+    // Spawn every stage, wiring each one's stdout into the next one's stdin.
+    let last = plan.len() - 1;
+    let mut children: Vec<Child> = Vec::with_capacity(plan.len());
+    let mut prev_stdout: Option<ChildStdout> = None;
+    let mut writer: Option<std::thread::JoinHandle<()>> = None;
+
+    for (i, stage) in plan.iter().enumerate() {
+        let mut cmd = stage.proxy.command(&stage.opts);
+
+        if i == 0 {
+            match &first_input {
+                FirstInput::Stdin => {
+                    cmd.stdin(Stdio::inherit());
+                }
+                FirstInput::File(p) => {
+                    let f = File::open(p)
+                        .map_err(|e| format!("opening {}: {e}", p.display()))?;
+                    cmd.stdin(Stdio::from(f));
+                }
+                // Literal text is fed in after spawn, on a thread (below).
+                FirstInput::Literal(_) => {
+                    cmd.stdin(Stdio::piped());
+                }
+            }
+        } else {
+            cmd.stdin(Stdio::from(prev_stdout.take().expect("previous stage stdout")));
         }
+
+        // The last stage writes straight to our stdout; the rest pipe onward.
+        if i == last {
+            cmd.stdout(Stdio::inherit());
+        } else {
+            cmd.stdout(Stdio::piped());
+        }
+        // stderr is inherited (default) so spinners/errors reach the terminal.
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("cannot run pipeline stage {:?}: {e}", stage.proxy.name()))?;
+
+        if i == 0 {
+            if let FirstInput::Literal(bytes) = &first_input {
+                let mut stdin = child.stdin.take().expect("piped stdin");
+                let data = bytes.clone();
+                writer = Some(std::thread::spawn(move || {
+                    let _ = stdin.write_all(&data);
+                    // stdin drops here, closing the pipe (EOF for the stage).
+                }));
+            }
+        }
+        if i != last {
+            prev_stdout = child.stdout.take();
+        }
+        children.push(child);
     }
 
-    let stdout = io::stdout();
-    let last = plan.len() - 1;
-    for (i, stage) in plan.iter().enumerate() {
-        let mut reader = io::Cursor::new(data);
-        if i == last {
-            let mut out = stdout.lock();
-            return stage.t.apply(&mut reader, &mut out, &stage.opts);
+    // Wait for every stage, collecting the exit codes of those that failed.
+    let mut failures: Vec<i32> = Vec::new();
+    for child in &mut children {
+        let status = child
+            .wait()
+            .map_err(|e| format!("waiting on pipeline stage: {e}"))?;
+        if !status.success() {
+            failures.push(status.code().unwrap_or(1));
         }
-        let mut buf: Vec<u8> = Vec::new();
-        stage
-            .t
-            .apply(&mut reader, &mut buf, &stage.opts)
-            .map_err(|e| format!("{}: {e}", stage.t.name()))?;
-        data = buf;
     }
-    Ok(())
+    if let Some(handle) = writer {
+        let _ = handle.join();
+    }
+
+    // Adopt one stage's code (the engine already wrote its own categorized
+    // message to the inherited stderr, so don't repeat it). Prefer a *categorized*
+    // failure (2 bad-input, 3 model-missing) over a generic 1 — when one stage
+    // dies, an adjacent stage often fails with a generic broken-pipe error that
+    // would otherwise mask the real cause; else take the first failure.
+    let code = failures
+        .iter()
+        .copied()
+        .find(|c| *c != 1)
+        .or_else(|| failures.first().copied());
+    match code {
+        Some(code) => Err(ChordError::Child(code).into()),
+        None => Ok(()),
+    }
 }
 
 fn print_ls(reg: &Registry) {

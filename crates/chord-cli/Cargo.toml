@@ -16,7 +16,8 @@ path = "src/main.rs"
 chord-core = { path = "../chord-core" }
 chord-hf = { path = "../chord-hf" }
 clap = "4"
-serde = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 serde_yaml_ng = "0.10"
 # `chord pull` downloads default models with a progress bar.
 ureq = "2"

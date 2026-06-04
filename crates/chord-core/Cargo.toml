@@ -6,5 +6,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# The kernel has NO dependencies — standard library only (the dependency rule).
+# The kernel links no *engine* code (the rule that keeps the dual-ggml symbol
+# clash out of the host). These are tiny, pure-Rust utility crates with no native
+# build scripts, so they never emit `cargo:rustc-link-lib` and are safe everywhere.
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+directories = "5"

@@ -7,7 +7,7 @@
 //!
 //! Output: 16-bit mono WAV at the model's sample rate (44.1 kHz).
 //!
-//! Options: `assets` (dir, default ~/.yapper/assets or $CHORD_TTS_ASSETS),
+//! Options: `assets` (dir, default <XDG data>/chord/tts/assets or $CHORD_TTS_ASSETS),
 //! `voice` (preset name or path, default M1), `lang` (default en),
 //! `steps` (denoise steps, default 8), `speed` (default 1.05),
 //! `silence` (seconds between chunks, default 0.3).
@@ -69,6 +69,9 @@ impl Transform for Tts {
     }
     fn describe(&self) -> &str {
         "text-to-speech (Supertonic / ONNX)"
+    }
+    fn backend(&self) -> &str {
+        "onnxruntime"
     }
     fn options(&self) -> &'static [OptionSpec] {
         OPTS
@@ -293,8 +296,7 @@ fn resolve_assets(opts: &Options) -> PathBuf {
             return PathBuf::from(a);
         }
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    Path::new(&home).join(".yapper").join("assets")
+    chord_core::dirs::data_dir().join("tts").join("assets")
 }
 
 fn resolve_voice(voice: &str, assets: &Path) -> PathBuf {

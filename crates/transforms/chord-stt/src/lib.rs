@@ -6,7 +6,7 @@
 //!
 //! Options (via `-o key=value`):
 //!   - `model` — model file path, or a short name resolved to
-//!     `~/models/ggml-<name>.bin` (default `large-v3-turbo`;
+//!     `<XDG data>/chord/models/ggml-<name>.bin` (default `large-v3-turbo`;
 //!     also honored via `$CHORD_STT_MODEL`).
 //!   - `lang`  — language code (e.g. `en`, `de`); omitted = whisper default.
 //!   - `threads` — CPU threads (default 4).
@@ -49,6 +49,9 @@ impl Transform for Stt {
     }
     fn describe(&self) -> &str {
         "speech-to-text (whisper.cpp)"
+    }
+    fn backend(&self) -> &str {
+        "whisper.cpp"
     }
     fn options(&self) -> &'static [OptionSpec] {
         OPTS
@@ -106,14 +109,11 @@ fn transcribe_one(
 /// `chord-stt --batch`: load the whisper model ONCE, then transcribe a list of
 /// files read from stdin (one `path` or `path<TAB>lang` per line), printing one
 /// transcript line per input (in order). This removes the per-call model-load
-/// cost that dominates per-segment pipelines.
-pub fn run_batch(args: &[String]) -> Result<()> {
+/// cost that dominates per-segment pipelines. Flags are parsed by the binary's
+/// clap front-end (see `main.rs`) and passed in typed.
+pub fn run_batch(model: Option<String>, default_lang: Option<String>, threads: i32) -> Result<()> {
     whisper_rs::install_logging_hooks();
-    let model = resolve_model_spec(arg_val(args, "--model"))?;
-    let default_lang = arg_val(args, "--lang");
-    let threads: i32 = arg_val(args, "--threads")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4);
+    let model = resolve_model_spec(model)?;
 
     let ctx = WhisperContext::new_with_params(
         model.to_str().ok_or("model path is not valid UTF-8")?,
@@ -143,11 +143,6 @@ pub fn run_batch(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Tiny `--flag value` lookup for the batch entrypoint (it doesn't use clap).
-fn arg_val(args: &[String], flag: &str) -> Option<String> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1).cloned())
-}
-
 /// Resolve the model: an existing path is used as-is; otherwise the value is a
 /// short catalog name resolved to `~/models/ggml-<name>.bin`.
 fn resolve_model(opts: &Options) -> Result<PathBuf> {
@@ -169,17 +164,16 @@ fn resolve_model_spec(spec: Option<String>) -> Result<PathBuf> {
         return Ok(direct.to_path_buf());
     }
 
-    let home = std::env::var("HOME").unwrap_or_default();
-    let candidate = Path::new(&home)
-        .join("models")
-        .join(format!("ggml-{spec}.bin"));
+    let candidate = chord_core::dirs::models_dir().join(format!("ggml-{spec}.bin"));
     if candidate.exists() {
         return Ok(candidate);
     }
 
     Err(ChordError::ModelMissing {
         what: format!("whisper model {spec:?} (looked at {})", candidate.display()),
-        hint: "run `chord pull stt`, or set --model to a ggml model path".to_string(),
+        hint: "run `chord pull stt` (models now live under the XDG data dir; move \
+               any legacy ~/models/* there), or set --model to a ggml model path"
+            .to_string(),
     }
     .into())
 }

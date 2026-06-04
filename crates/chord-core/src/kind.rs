@@ -1,11 +1,14 @@
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// A data kind (modality) that plug-ins consume and produce.
 ///
 /// Deliberately coarse: the kernel reasons about modalities, not codecs. The
 /// difference between WAV and MP3, or PNG and JPEG, is a plug-in's concern, not
 /// the core's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Kind {
     Text,
     Audio,

@@ -1,22 +1,27 @@
-use std::fmt;
+//! A categorized error, so the CLI can choose a meaningful process exit code.
+//!
+//! Engines return these for known conditions; any other error (I/O, an engine
+//! SDK failure, …) boxes into [`crate::Error`] and is treated as a generic
+//! failure (exit code 1). Keeping this in the kernel lets every engine and the
+//! host agree on the same categories and codes.
 
-/// A categorized error, so the CLI can choose a meaningful process exit code.
-///
-/// Engines return these for known conditions; any other error (I/O, an engine
-/// SDK failure, …) boxes into [`crate::Error`] and is treated as a generic
-/// failure (exit code 1). Keeping this in the kernel lets every engine and the
-/// host agree on the same categories and codes.
-#[derive(Debug)]
+use thiserror::Error;
+
+#[derive(Debug, Error)]
 pub enum ChordError {
     /// A required model or asset isn't present. `hint` tells the user how to
     /// get it (e.g. "run `chord pull stt`").
+    #[error("{what} not found — {hint}")]
     ModelMissing { what: String, hint: String },
     /// The input was empty or malformed.
+    #[error("{0}")]
     BadInput(String),
     /// The engine failed at runtime.
+    #[error("{0}")]
     Engine(String),
     /// A spawned engine process already reported its own error to stderr; this
     /// just carries its exit code up so the host can exit with the same one.
+    #[error("engine exited with code {0}")]
     Child(i32),
 }
 
@@ -48,15 +53,3 @@ impl ChordError {
         }
     }
 }
-
-impl fmt::Display for ChordError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ChordError::ModelMissing { what, hint } => write!(f, "{what} not found — {hint}"),
-            ChordError::BadInput(m) | ChordError::Engine(m) => write!(f, "{m}"),
-            ChordError::Child(code) => write!(f, "engine exited with code {code}"),
-        }
-    }
-}
-
-impl std::error::Error for ChordError {}

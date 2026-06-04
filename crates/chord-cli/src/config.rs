@@ -95,16 +95,8 @@ fn discover() -> Option<PathBuf> {
     if cwd.exists() {
         return Some(cwd.to_path_buf());
     }
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| Path::new(&h).join(".config"))
-        })?;
-    let p = base.join("chord").join("config.yaml");
+    // The XDG config dir (`$XDG_CONFIG_HOME/chord`), via the shared `dirs` module.
+    let p = chord_core::dirs::config_dir().join("config.yaml");
     p.exists().then_some(p)
 }
 

@@ -6,7 +6,7 @@
 //! (system + user) conversation, generates a reply, and writes it to stdout.
 //!
 //! Options (via config or `-o`):
-//! - `model` — GGUF path (default `$CHORD_CHAT_MODEL` or the Qwen3-30B-A3B GGUF under ~/.kronk/models)
+//! - `model` — GGUF path (default `$CHORD_CHAT_MODEL` or the Qwen3-30B-A3B GGUF under the XDG models dir)
 //! - `system` — optional system prompt
 //! - `max_tokens` — reply length cap (default 512)
 //! - `temperature` — sampling temperature; 0 = greedy (default 0.7)
@@ -77,6 +77,9 @@ impl Transform for Chat {
     }
     fn describe(&self) -> &str {
         "chat / text generation (llama.cpp)"
+    }
+    fn backend(&self) -> &str {
+        "llama.cpp"
     }
     fn options(&self) -> &'static [OptionSpec] {
         OPTS
@@ -276,7 +279,7 @@ fn spinner(msg: &str) -> ProgressBar {
 }
 
 /// Resolve the GGUF model path: `model` option, else `$CHORD_CHAT_MODEL`, else
-/// the Qwen3-30B-A3B GGUF under ~/.kronk/models.
+/// the Qwen3-30B-A3B GGUF under the XDG models dir.
 fn resolve_model(opts: &Options) -> Result<PathBuf> {
     if let Some(m) = opts.get("model") {
         return chord_hf::resolve(m);
@@ -286,9 +289,8 @@ fn resolve_model(opts: &Options) -> Result<PathBuf> {
             return chord_hf::resolve(&m);
         }
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let default = PathBuf::from(home)
-        .join(".kronk/models/unsloth/Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q4_K_M.gguf");
+    let default = chord_core::dirs::models_dir()
+        .join("unsloth/Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q4_K_M.gguf");
     if default.exists() {
         return Ok(default);
     }

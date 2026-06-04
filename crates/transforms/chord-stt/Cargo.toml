@@ -14,6 +14,7 @@ path = "src/main.rs"
 chord-core = { path = "../../chord-core" }
 chord-runner = { path = "../../chord-runner" }
 chord-hf = { path = "../../chord-hf" }
+clap = "4"
 # whisper-rs: Rust bindings to whisper.cpp (tazz4843, Codeberg upstream).
 # Compiles whisper.cpp from a git submodule at build time (needs cmake + cc).
 whisper-rs = { git = "https://codeberg.org/tazz4843/whisper-rs" }

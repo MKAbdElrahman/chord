@@ -16,20 +16,40 @@
 //! exec-proxy in `chord-cli`). Flag names here therefore mirror the options the
 //! proxy forwards.
 
-use std::io;
+use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 
-use chord_core::{ChordError, Options, Transform};
+use chord_core::events;
+use chord_core::{ChordError, Manifest, Options, Transform};
 use clap::{Arg, ArgAction, Command};
 
 /// Run `t` as a filter: parse argv, read the input file (or stdin), apply, and
 /// write to stdout. Returns a process exit code.
 pub fn run(t: &dyn Transform) -> ExitCode {
+    // Self-description protocol: when the host asks `chord-<name> --chord-manifest`,
+    // print this engine's metadata as JSON and exit. This is how the host
+    // discovers the plug-in, so the engine's own `Transform` impl is the single
+    // source of truth for its name, kinds, backend, and options.
+    if std::env::args().any(|a| a == "--chord-manifest") {
+        match serde_json::to_string(&Manifest::of(t)) {
+            Ok(json) => {
+                println!("{json}");
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("chord-{}: manifest: {e}", t.name());
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    init_tracing();
+
     let matches = build_command(t).get_matches();
     let jsonl = matches.get_one::<String>("format").map(String::as_str) == Some("jsonl");
 
     if jsonl {
-        emit(serde_json::json!({ "event": "start", "transform": t.name() }));
+        emit(&events::Start::new(t.name()));
     }
 
     let mut opts = Options::new();
@@ -61,7 +81,7 @@ pub fn run(t: &dyn Transform) -> ExitCode {
     match result {
         Ok(()) => {
             if jsonl {
-                emit(serde_json::json!({ "event": "done", "transform": t.name() }));
+                emit(&events::Done::new(t.name()));
             }
             ExitCode::SUCCESS
         }
@@ -71,13 +91,12 @@ pub fn run(t: &dyn Transform) -> ExitCode {
             let ce = e.downcast_ref::<ChordError>();
             let code = ce.map(ChordError::exit_code).unwrap_or(1);
             if jsonl {
-                emit(serde_json::json!({
-                    "event": "error",
-                    "transform": t.name(),
-                    "code": code,
-                    "kind": ce.map(ChordError::kind).unwrap_or("engine"),
-                    "message": e.to_string(),
-                }));
+                emit(&events::Error::new(
+                    t.name(),
+                    code,
+                    ce.map(ChordError::kind).unwrap_or("engine"),
+                    e.to_string(),
+                ));
             } else {
                 eprintln!("chord-{}: {e}", t.name());
             }
@@ -86,10 +105,24 @@ pub fn run(t: &dyn Transform) -> ExitCode {
     }
 }
 
+/// Initialize structured logging once: engine/native-library diagnostics go to
+/// stderr, filtered by `RUST_LOG` (default: quiet), and ANSI is used only when
+/// stderr is a terminal so pipes stay clean. Idempotent across engines.
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let _ = fmt()
+        .with_writer(io::stderr)
+        .with_ansi(io::stderr().is_terminal())
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")))
+        .try_init();
+}
+
 /// Emit one NDJSON event on stderr (the machine-readable status channel; the
 /// data plane stays on stdout).
-fn emit(event: serde_json::Value) {
-    eprintln!("{event}");
+fn emit(event: &impl serde::Serialize) {
+    if let Ok(line) = serde_json::to_string(event) {
+        eprintln!("{line}");
+    }
 }
 
 /// Build the clap command: program name `chord-<name>`, a positional input, and

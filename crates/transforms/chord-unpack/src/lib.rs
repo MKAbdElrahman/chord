@@ -11,7 +11,9 @@
 //! chord pack --image a.png          | chord unpack --part 1 > a_out.png
 //! ```
 
-use chord_core::{ChordError, Kind, Message, OptionSpec, Options, Part, Result, Signature, Transform};
+use chord_core::{
+    ChordError, Kind, Message, OptionSpec, Options, Part, Result, Signature, Transform,
+};
 
 const ALL_KINDS: [Kind; 4] = [Kind::Text, Kind::Audio, Kind::Image, Kind::Video];
 

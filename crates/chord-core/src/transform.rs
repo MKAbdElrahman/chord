@@ -85,12 +85,7 @@ impl Signature {
 
     /// Human rendering for `chord ls` / `--help`, e.g. `"text,image,audio -> text"`.
     pub fn display(&self) -> String {
-        let join = |ks: &[Kind]| {
-            ks.iter()
-                .map(Kind::as_str)
-                .collect::<Vec<_>>()
-                .join(",")
-        };
+        let join = |ks: &[Kind]| ks.iter().map(Kind::as_str).collect::<Vec<_>>().join(",");
         format!("{} -> {}", join(&self.accepts), join(&self.emits))
     }
 }

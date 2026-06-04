@@ -123,11 +123,9 @@ impl Message {
         match self.parts.as_slice() {
             [p] if p.kind == kind => Ok(p),
             [] => Err(ChordError::BadInput(format!("expected one {kind} part, got none")).into()),
-            [p] => Err(ChordError::BadInput(format!(
-                "expected a {kind} part, got {}",
-                p.kind
-            ))
-            .into()),
+            [p] => {
+                Err(ChordError::BadInput(format!("expected a {kind} part, got {}", p.kind)).into())
+            }
             parts => Err(ChordError::BadInput(format!(
                 "expected one {kind} part, got {}",
                 parts.len()
@@ -224,7 +222,12 @@ pub fn decode(r: &mut dyn Read, default_kind: Kind) -> Result<Message> {
                 return Err(ChordError::BadInput(format!("bad body tag {other}")).into());
             }
         };
-        parts.push(Part { kind, mime, meta, body });
+        parts.push(Part {
+            kind,
+            mime,
+            meta,
+            body,
+        });
     }
     Ok(Message { parts })
 }
@@ -361,9 +364,15 @@ mod tests {
         assert_eq!(back.parts.len(), 3);
         assert_eq!(back.parts[0].kind, Kind::Image);
         assert_eq!(back.parts[0].mime, "image/png");
-        assert_eq!(back.parts[0].meta.get("role").map(String::as_str), Some("user"));
+        assert_eq!(
+            back.parts[0].meta.get("role").map(String::as_str),
+            Some("user")
+        );
         assert_eq!(back.parts[1].kind, Kind::Text);
-        assert_eq!(back.parts[1].as_bytes(), b"describe this and transcribe the audio");
+        assert_eq!(
+            back.parts[1].as_bytes(),
+            b"describe this and transcribe the audio"
+        );
         assert_eq!(back.parts[2].kind, Kind::Audio);
         assert_eq!(back.parts[2].as_bytes(), &[9, 8, 7, 6]);
     }

@@ -17,11 +17,11 @@
 //! on this one — never the reverse.
 
 pub mod dirs;
-pub mod events;
-pub mod message;
 mod error;
+pub mod events;
 mod kind;
 mod manifest;
+pub mod message;
 mod registry;
 mod transform;
 

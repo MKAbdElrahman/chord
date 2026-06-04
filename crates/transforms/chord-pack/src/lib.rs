@@ -11,7 +11,9 @@
 
 use std::path::Path;
 
-use chord_core::{ChordError, Kind, Message, OptionSpec, Options, Part, Result, Signature, Transform};
+use chord_core::{
+    ChordError, Kind, Message, OptionSpec, Options, Part, Result, Signature, Transform,
+};
 
 const OPTS: &[OptionSpec] = &[
     OptionSpec {

@@ -257,10 +257,10 @@ fn run_filter(t: &dyn Transform, m: &ArgMatches, config: &Config) -> Result<()> 
                 // argument as the literal input, so `chord chat "hi"` works.
                 chord_core::Message::one(chord_core::Part::text(arg.clone()))
             } else {
-                return Err(
-                    chord_core::ChordError::BadInput(format!("input file not found: {arg:?}"))
-                        .into(),
-                );
+                return Err(chord_core::ChordError::BadInput(format!(
+                    "input file not found: {arg:?}"
+                ))
+                .into());
             }
         }
         _ => {
@@ -317,8 +317,8 @@ fn run_pipeline(m: &ArgMatches, config: &Config) -> Result<()> {
     let mut plan: Vec<Stage> = Vec::with_capacity(stages.len());
     for stage in &stages {
         let name = stage[0].as_str();
-        let p = proxy::resolve(name)
-            .ok_or_else(|| format!("pipeline: unknown transform {name:?}"))?;
+        let p =
+            proxy::resolve(name).ok_or_else(|| format!("pipeline: unknown transform {name:?}"))?;
         let argv = std::iter::once(name.to_string()).chain(stage[1..].iter().cloned());
         let matches = transform_command(&p)
             .try_get_matches_from(argv)
@@ -352,9 +352,7 @@ fn run_pipeline(m: &ArgMatches, config: &Config) -> Result<()> {
             } else if plan[0].proxy.signature().accepts_kind(Kind::Text) {
                 FirstInput::Literal(arg.as_bytes().to_vec())
             } else {
-                return Err(
-                    ChordError::BadInput(format!("input file not found: {arg:?}")).into(),
-                );
+                return Err(ChordError::BadInput(format!("input file not found: {arg:?}")).into());
             }
         }
         _ => FirstInput::Stdin,
@@ -375,8 +373,7 @@ fn run_pipeline(m: &ArgMatches, config: &Config) -> Result<()> {
                     cmd.stdin(Stdio::inherit());
                 }
                 FirstInput::File(p) => {
-                    let f = File::open(p)
-                        .map_err(|e| format!("opening {}: {e}", p.display()))?;
+                    let f = File::open(p).map_err(|e| format!("opening {}: {e}", p.display()))?;
                     cmd.stdin(Stdio::from(f));
                 }
                 // Literal text is fed in after spawn, on a thread (below).
@@ -385,7 +382,9 @@ fn run_pipeline(m: &ArgMatches, config: &Config) -> Result<()> {
                 }
             }
         } else {
-            cmd.stdin(Stdio::from(prev_stdout.take().expect("previous stage stdout")));
+            cmd.stdin(Stdio::from(
+                prev_stdout.take().expect("previous stage stdout"),
+            ));
         }
 
         // The last stage writes straight to our stdout; the rest pipe onward.

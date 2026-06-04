@@ -18,10 +18,10 @@ jobs:
       # chord's engine plug-ins link heavy native libraries (llama.cpp,
       # whisper.cpp, ONNX Runtime, sherpa-onnx, stable-diffusion.cpp), and the
       # multimodal `chat` engine path-deps an out-of-tree mistral.rs checkout.
-      # CI validates the pure-Rust kernel, host, and light transforms (core,
-      # runner, hf, cli, pack, unpack); drop chord-chat from the workspace so
-      # resolution doesn't require the sibling mistral.rs repo. The native
-      # engines are built per-machine (see the README install steps).
+      # This job validates the pure-Rust kernel, host, and light transforms;
+      # the native-backed engines have their own matrix job below. The
+      # multimodal `chat` engine path-deps an out-of-tree mistral.rs, so drop it
+      # from the workspace so resolution doesn't require the sibling repo.
       - name: Trim workspace to CI-buildable crates
         run: sed -i '\#"crates/transforms/chord-chat",#d' Cargo.toml
 
@@ -55,3 +55,48 @@ jobs:
 
       - name: Test
         run: cargo test --verbose -p chord-core -p chord-pack -p chord-unpack
+
+  engines:
+    name: link ${{ matrix.backend }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Build every backend even if one fails, so a red X points at the engine.
+      fail-fast: false
+      matrix:
+        include:
+          - backend: whisper.cpp
+            crates: "-p chord-stt"
+          - backend: llama.cpp
+            crates: "-p chord-text -p chord-see -p chord-stt-llama"
+          - backend: onnxruntime
+            crates: "-p chord-tts -p chord-redact"
+          - backend: stable-diffusion.cpp
+            crates: "-p chord-draw"
+          - backend: sherpa-onnx
+            crates: "-p chord-stt-sherpa -p chord-diarize -p chord-vad -p chord-langid"
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same reason as the build job: drop the mistral.rs-backed chat engine so
+      # workspace resolution doesn't need the sibling repo.
+      - name: Trim workspace
+        run: sed -i '\#"crates/transforms/chord-chat",#d' Cargo.toml
+
+      # cmake + a C/C++ compiler build llama.cpp / whisper.cpp / sd.cpp from the
+      # vendoring -sys crates; libclang is for their bindgen. ort and sherpa-rs
+      # download prebuilt libraries at build time.
+      - name: Install native toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.backend }}
+
+      - name: Build (link against ${{ matrix.backend }})
+        run: cargo build --verbose ${{ matrix.crates }}

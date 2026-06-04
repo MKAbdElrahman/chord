@@ -1,0 +1,20 @@
+[package]
+name = "chord-text"
+description = "chord text-generation plug-in (llama.cpp via llama-cpp-2): text -> text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "chord-text"
+path = "src/main.rs"
+
+[dependencies]
+chord-core = { path = "../../chord-core" }
+chord-runner = { path = "../../chord-runner" }
+chord-hf = { path = "../../chord-hf" }
+llama-cpp-2 = "0.1.146"
+encoding_rs = "0.8"
+indicatif = "0.18.4"
+serde_json = "1.0.150"

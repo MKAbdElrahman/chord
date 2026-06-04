@@ -1,0 +1,15 @@
+[package]
+name = "chord-unpack"
+description = "chord unpack plug-in: inspect or extract parts from a multimodal message"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "chord-unpack"
+path = "src/main.rs"
+
+[dependencies]
+chord-core = { path = "../../chord-core" }
+chord-runner = { path = "../../chord-runner" }

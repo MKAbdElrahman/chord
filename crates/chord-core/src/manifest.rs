@@ -31,14 +31,20 @@ impl From<&OptionSpec> for ManifestOption {
 }
 
 /// A serializable description of one transform plug-in.
+///
+/// `version` lets the host ignore manifest-cache entries written by an older
+/// schema (e.g. the pre-`Message` `from`/`to` shape) without a manual cache wipe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
+    /// Manifest schema version. Bump when the fields below change shape.
+    #[serde(default)]
+    pub version: u32,
     /// CLI verb (e.g. `"stt"`).
     pub name: String,
-    /// Input modality.
-    pub from: Kind,
-    /// Output modality.
-    pub to: Kind,
+    /// Input modalities this transform consumes.
+    pub accepts: Vec<Kind>,
+    /// Output modalities this transform produces.
+    pub emits: Vec<Kind>,
     /// Inference backend (e.g. `"whisper.cpp"`); empty for engine-less transforms.
     pub backend: String,
     /// One-line human summary.
@@ -47,13 +53,19 @@ pub struct Manifest {
     pub options: Vec<ManifestOption>,
 }
 
+/// Current manifest schema version. Entries with a different version are
+/// re-queried by the host's discovery cache.
+pub const MANIFEST_VERSION: u32 = 2;
+
 impl Manifest {
     /// Snapshot a live transform's metadata into a serializable manifest.
     pub fn of(t: &dyn Transform) -> Self {
+        let sig = t.signature();
         Manifest {
+            version: MANIFEST_VERSION,
             name: t.name().to_string(),
-            from: t.from(),
-            to: t.to(),
+            accepts: sig.accepts,
+            emits: sig.emits,
             backend: t.backend().to_string(),
             describe: t.describe().to_string(),
             options: t.options().iter().map(ManifestOption::from).collect(),

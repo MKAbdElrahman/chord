@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 
+use crate::message::{Message, Part};
 use crate::{Kind, Result};
 
 /// Per-transform configuration (e.g. `voice=M1`, `model=tiny`, `lang=de`).
@@ -44,34 +45,79 @@ pub struct OptionSpec {
     pub takes_value: bool,
 }
 
-/// A `Transform` converts one data [`Kind`] into another. It is a self-contained
-/// Unix filter: read `input`, write `output`.
+/// The kinds a transform consumes and produces. Coarse on purpose: the kernel
+/// type-checks on modality (`accepts ∩ next.emits`), while exact codecs/order
+/// are an engine/adapter concern. A mono-modal transform has one of each.
+#[derive(Debug, Clone)]
+pub struct Signature {
+    pub accepts: Vec<Kind>,
+    pub emits: Vec<Kind>,
+}
+
+impl Signature {
+    pub fn new(accepts: Vec<Kind>, emits: Vec<Kind>) -> Self {
+        Signature { accepts, emits }
+    }
+
+    /// The 1→1 signature: one `from` part in, one `to` part out.
+    pub fn unary(from: Kind, to: Kind) -> Self {
+        Signature {
+            accepts: vec![from],
+            emits: vec![to],
+        }
+    }
+
+    /// The primary input kind — the default a raw (unframed) input decodes to.
+    pub fn primary_in(&self) -> Kind {
+        self.accepts.first().copied().unwrap_or(Kind::Text)
+    }
+
+    /// The primary output kind — the default a raw (unframed) child output
+    /// decodes to.
+    pub fn primary_out(&self) -> Kind {
+        self.emits.first().copied().unwrap_or(Kind::Text)
+    }
+
+    /// True if this transform can consume a `kind` input.
+    pub fn accepts_kind(&self, kind: Kind) -> bool {
+        self.accepts.contains(&kind)
+    }
+
+    /// Human rendering for `chord ls` / `--help`, e.g. `"text,image,audio -> text"`.
+    pub fn display(&self) -> String {
+        let join = |ks: &[Kind]| {
+            ks.iter()
+                .map(Kind::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!("{} -> {}", join(&self.accepts), join(&self.emits))
+    }
+}
+
+/// A `Transform` is the chord plug-in contract in full generality: a function
+/// from a [`Message`] (ordered typed parts) to a `Message`. Composition is the
+/// shell pipe; the kernel does no routing.
 ///
 /// Contract every implementation MUST honor:
 /// 1. **Stateless across calls** — the value holds config, not per-request state.
-/// 2. **Stream, don't hoard** — read `input`, write `output`; never close
-///    `output`, and never write logs/progress to it (stdout is the data plane;
-///    diagnostics go to stderr).
-/// 3. **Kind honesty** — [`from`](Transform::from)/[`to`](Transform::to) must be
-///    accurate.
-/// 4. **Options are advisory** — ignore unknown keys; default missing ones.
+/// 2. **Signature honesty** — [`signature`](Transform::signature) must be accurate.
+/// 3. **Options are advisory** — ignore unknown keys; default missing ones.
+///
+/// Mono-modal engines should implement [`Unary`] instead — the blanket impl
+/// below lifts them into this trait for free.
 pub trait Transform: Send + Sync {
-    /// Unique CLI verb for this plug-in (e.g. `"stt"`, `"tts"`).
+    /// Unique CLI verb for this plug-in (e.g. `"chat"`, `"stt"`).
     fn name(&self) -> &str;
 
-    /// Input modality.
-    fn from(&self) -> Kind;
-
-    /// Output modality.
-    fn to(&self) -> Kind;
+    /// The kinds this transform consumes and produces.
+    fn signature(&self) -> Signature;
 
     /// One-line human summary, shown by `chord ls`.
     fn describe(&self) -> &str;
 
     /// The inference backend this transform requires (e.g. `"whisper.cpp"`,
-    /// `"llama.cpp"`, `"mistral.rs"`). Backends are modular: a transform
-    /// declares the engine it runs on, and the host routes to it. Defaults to
-    /// empty for transforms with no external engine.
+    /// `"llama.cpp"`, `"mistral.rs"`); empty for engine-less transforms.
     fn backend(&self) -> &str {
         ""
     }
@@ -82,6 +128,73 @@ pub trait Transform: Send + Sync {
         &[]
     }
 
-    /// Read the input stream, write the output stream.
+    /// Transform an input message into an output message.
+    fn apply(&self, input: Message, opts: &Options) -> Result<Message>;
+}
+
+/// A 1→1 transform: exactly one input part of one [`Kind`], exactly one output
+/// part of another. This is the common, mono-modal case (`stt`, `tts`, `text`,
+/// `see`, `draw`, `redact`, …); implementing it keeps the familiar
+/// read-stream/write-stream body. The blanket impl below makes every `Unary`
+/// a [`Transform`].
+pub trait Unary: Send + Sync {
+    /// Unique CLI verb for this plug-in.
+    fn name(&self) -> &str;
+
+    /// Input modality.
+    fn from(&self) -> Kind;
+
+    /// Output modality.
+    fn to(&self) -> Kind;
+
+    /// One-line human summary.
+    fn describe(&self) -> &str;
+
+    /// Inference backend; empty for engine-less transforms.
+    fn backend(&self) -> &str {
+        ""
+    }
+
+    /// Options this transform accepts.
+    fn options(&self) -> &'static [OptionSpec] {
+        &[]
+    }
+
+    /// Read the single input part's bytes, write the single output part's bytes.
     fn apply(&self, input: &mut dyn Read, output: &mut dyn Write, opts: &Options) -> Result<()>;
+}
+
+/// Every [`Unary`] is a [`Transform`]: take the one input part of `from()`,
+/// run the stream-in/stream-out body into a buffer, and wrap the buffer as the
+/// one output part of `to()`.
+impl<T: Unary> Transform for T {
+    fn name(&self) -> &str {
+        Unary::name(self)
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::unary(Unary::from(self), Unary::to(self))
+    }
+
+    fn describe(&self) -> &str {
+        Unary::describe(self)
+    }
+
+    fn backend(&self) -> &str {
+        Unary::backend(self)
+    }
+
+    fn options(&self) -> &'static [OptionSpec] {
+        Unary::options(self)
+    }
+
+    fn apply(&self, input: Message, opts: &Options) -> Result<Message> {
+        let from = Unary::from(self);
+        let to = Unary::to(self);
+        let bytes = input.single(from)?.as_bytes().to_vec();
+        let mut rd = Cursor::new(bytes);
+        let mut out = Vec::new();
+        Unary::apply(self, &mut rd, &mut out, opts)?;
+        Ok(Message::one(Part::new(to, out)))
+    }
 }

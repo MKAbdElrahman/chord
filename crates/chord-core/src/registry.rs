@@ -43,11 +43,11 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Kind, Options, Result};
+    use crate::{Kind, Options, Result, Unary};
     use std::io::{Read, Write};
 
     struct Noop(&'static str);
-    impl Transform for Noop {
+    impl Unary for Noop {
         fn name(&self) -> &str {
             self.0
         }

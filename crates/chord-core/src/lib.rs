@@ -4,7 +4,9 @@
 //! architecture. It defines:
 //!
 //! - [`Kind`]: the coarse data modalities plug-ins consume and produce.
-//! - [`Transform`]: the plug-in contract (a self-contained Unix filter).
+//! - [`Message`]: the data plane — an ordered list of typed [`Part`]s.
+//! - [`Transform`]: the plug-in contract (`Message -> Message`); [`Unary`] is
+//!   the mono-modal special case.
 //! - [`Registry`]: a name -> plug-in directory for CLI dispatch.
 //! - [`Manifest`]: the serializable host↔engine wire description of a plug-in.
 //! - [`dirs`]: the single source of truth for XDG paths.
@@ -16,6 +18,7 @@
 
 pub mod dirs;
 pub mod events;
+pub mod message;
 mod error;
 mod kind;
 mod manifest;
@@ -24,9 +27,10 @@ mod transform;
 
 pub use error::ChordError;
 pub use kind::Kind;
-pub use manifest::{Manifest, ManifestOption};
+pub use manifest::{Manifest, ManifestOption, MANIFEST_VERSION};
+pub use message::{decode, encode, Body, Message, Part};
 pub use registry::Registry;
-pub use transform::{OptionSpec, Options, Transform};
+pub use transform::{OptionSpec, Options, Signature, Transform, Unary};
 
 /// Boxed error type used across the kernel. Keeps the core dependency-free
 /// while letting plug-ins return any `std::error::Error`.

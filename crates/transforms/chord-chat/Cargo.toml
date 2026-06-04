@@ -1,6 +1,6 @@
 [package]
 name = "chord-chat"
-description = "chord chat plug-in (llama.cpp via llama-cpp-2): text -> text"
+description = "chord multimodal chat plug-in (mistral.rs): text/image/audio -> text"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,8 +13,10 @@ path = "src/main.rs"
 [dependencies]
 chord-core = { path = "../../chord-core" }
 chord-runner = { path = "../../chord-runner" }
-chord-hf = { path = "../../chord-hf" }
-llama-cpp-2 = "0.1.146"
-encoding_rs = "0.8"
-indicatif = "0.18.4"
-serde_json = "1.0.150"
+# Multimodal backend. Path dep into the sibling mistral.rs checkout; this engine
+# is a separate out-of-process binary, so the candle/ggml it pulls in never
+# touches the host or the llama.cpp engines.
+mistralrs = { path = "../../../../mistral.rs/mistralrs" }
+tokio = { version = "1.49", features = ["rt-multi-thread"] }
+# Must resolve to the SAME 0.25.x as mistral.rs so `DynamicImage` is one type.
+image = "0.25"

@@ -15,7 +15,7 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Transform};
+use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Unary};
 use indicatif::{ProgressBar, ProgressStyle};
 
 const OPTS: &[OptionSpec] = &[
@@ -62,7 +62,7 @@ use llama_cpp_2::{send_logs_to_tracing, LogOptions};
 
 pub struct See;
 
-impl Transform for See {
+impl Unary for See {
     fn name(&self) -> &str {
         "see"
     }

@@ -65,18 +65,27 @@ pub fn run(t: &dyn Transform) -> ExitCode {
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
+    // A raw (unframed) input decodes to a single part of this transform's
+    // primary input kind; the singleton-raw rule keeps mono-modal pipes clean.
+    let default_kind = t.signature().primary_in();
 
-    let result = match matches.get_one::<String>("input") {
-        Some(path) if path != "-" => match std::fs::File::open(path) {
-            Ok(mut f) => t.apply(&mut f, &mut out, &opts),
-            Err(e) => Err(format!("opening {path}: {e}").into()),
-        },
-        _ => {
-            let stdin = io::stdin();
-            let mut input = stdin.lock();
-            t.apply(&mut input, &mut out, &opts)
-        }
-    };
+    let result = (|| -> chord_core::Result<()> {
+        let input = match matches.get_one::<String>("input") {
+            Some(path) if path != "-" => {
+                let mut f = std::fs::File::open(path)
+                    .map_err(|e| -> chord_core::Error { format!("opening {path}: {e}").into() })?;
+                chord_core::decode(&mut f, default_kind)?
+            }
+            _ => {
+                let stdin = io::stdin();
+                let mut input = stdin.lock();
+                chord_core::decode(&mut input, default_kind)?
+            }
+        };
+        let output = t.apply(input, &opts)?;
+        chord_core::encode(&output, &mut out)?;
+        Ok(())
+    })();
 
     match result {
         Ok(()) => {

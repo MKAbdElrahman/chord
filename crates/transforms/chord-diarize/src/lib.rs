@@ -7,7 +7,7 @@
 
 use std::io::{Read, Write};
 
-use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Transform};
+use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Unary};
 use sherpa_rs::diarize::{Diarize, DiarizeConfig};
 
 const DEF_SEG: &str = "hf:csukuangfj/sherpa-onnx-pyannote-segmentation-3-0:model.onnx";
@@ -39,7 +39,7 @@ const OPTS: &[OptionSpec] = &[
 
 pub struct Diarizer;
 
-impl Transform for Diarizer {
+impl Unary for Diarizer {
     fn name(&self) -> &str {
         "diarize"
     }

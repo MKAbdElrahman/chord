@@ -11,7 +11,7 @@ mod proxy;
 mod pull;
 
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{exit, Child, ChildStdout, Stdio};
 
@@ -179,7 +179,7 @@ fn transform_command(t: &dyn Transform) -> Command {
     // leaking these few small strings is fine in the host.
     let name: &'static str = Box::leak(t.name().to_owned().into_boxed_str());
     let mut cmd = Command::new(name)
-        .about(format!("{}  ({} -> {})", t.describe(), t.from(), t.to()))
+        .about(format!("{}  ({})", t.describe(), t.signature().display()))
         .arg(
             Arg::new("input")
                 .help("input file, or inline text for text inputs (default: stdin)")
@@ -244,30 +244,41 @@ fn run_filter(t: &dyn Transform, m: &ArgMatches, config: &Config) -> Result<()> 
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
+    let default_kind = t.signature().primary_in();
 
-    match m.get_one::<String>("input") {
+    // Build the input message, run the transform, encode the output message.
+    let input = match m.get_one::<String>("input") {
         Some(arg) if arg != "-" => {
             if std::path::Path::new(arg).is_file() {
                 let mut f = File::open(arg)?;
-                t.apply(&mut f, &mut out, &opts)
-            } else if t.from() == Kind::Text {
+                chord_core::decode(&mut f, default_kind)?
+            } else if t.signature().accepts_kind(Kind::Text) {
                 // Not a file, and this transform consumes text: treat the
                 // argument as the literal input, so `chord chat "hi"` works.
-                let mut cursor = io::Cursor::new(arg.clone().into_bytes());
-                t.apply(&mut cursor, &mut out, &opts)
+                chord_core::Message::one(chord_core::Part::text(arg.clone()))
             } else {
-                Err(
+                return Err(
                     chord_core::ChordError::BadInput(format!("input file not found: {arg:?}"))
                         .into(),
-                )
+                );
             }
         }
         _ => {
             let stdin = io::stdin();
-            let mut input = stdin.lock();
-            t.apply(&mut input, &mut out, &opts)
+            // No file arg and nothing piped in: don't block reading an interactive
+            // terminal. Source transforms (e.g. `pack`) build their output from
+            // flags alone; others surface a clean "no input" error.
+            if stdin.is_terminal() {
+                chord_core::Message::empty()
+            } else {
+                let mut input = stdin.lock();
+                chord_core::decode(&mut input, default_kind)?
+            }
         }
-    }
+    };
+    let output = t.apply(input, &opts)?;
+    chord_core::encode(&output, &mut out)?;
+    Ok(())
 }
 
 /// Run a multi-stage pipeline as a true streaming chain. Stages are separated by
@@ -338,7 +349,7 @@ fn run_pipeline(m: &ArgMatches, config: &Config) -> Result<()> {
         Some(arg) if arg != "-" => {
             if Path::new(arg).is_file() {
                 FirstInput::File(PathBuf::from(arg))
-            } else if plan[0].proxy.from() == Kind::Text {
+            } else if plan[0].proxy.signature().accepts_kind(Kind::Text) {
                 FirstInput::Literal(arg.as_bytes().to_vec())
             } else {
                 return Err(
@@ -437,7 +448,7 @@ fn run_pipeline(m: &ArgMatches, config: &Config) -> Result<()> {
 
 fn print_ls(reg: &Registry) {
     println!(
-        "{:<8} {:<15} {:<22} DESCRIPTION",
+        "{:<8} {:<18} {:<22} DESCRIPTION",
         "NAME", "KINDS", "BACKEND"
     );
     for t in reg.all() {
@@ -447,9 +458,9 @@ fn print_ls(reg: &Registry) {
             t.backend()
         };
         println!(
-            "{:<8} {:<15} {:<22} {}",
+            "{:<8} {:<18} {:<22} {}",
             t.name(),
-            format!("{} -> {}", t.from(), t.to()),
+            t.signature().display(),
             backend,
             t.describe()
         );

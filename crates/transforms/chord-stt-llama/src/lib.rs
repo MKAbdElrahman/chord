@@ -10,7 +10,7 @@ use std::io::{IsTerminal, Read, Write};
 use std::num::NonZeroU32;
 use std::time::Duration;
 
-use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Transform};
+use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Unary};
 use indicatif::{ProgressBar, ProgressStyle};
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -68,7 +68,7 @@ const OPTS: &[OptionSpec] = &[
 
 pub struct SttLlama;
 
-impl Transform for SttLlama {
+impl Unary for SttLlama {
     fn name(&self) -> &str {
         "stt"
     }

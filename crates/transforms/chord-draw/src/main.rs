@@ -80,9 +80,10 @@ fn print_manifest() {
         takes_value: true,
     };
     let manifest = chord_core::Manifest {
+        version: chord_core::MANIFEST_VERSION,
         name: "draw".to_string(),
-        from: chord_core::Kind::Text,
-        to: chord_core::Kind::Image,
+        accepts: vec![chord_core::Kind::Text],
+        emits: vec![chord_core::Kind::Image],
         backend: "stable-diffusion.cpp".to_string(),
         describe: "text-to-image (stable-diffusion.cpp)".to_string(),
         options: vec![

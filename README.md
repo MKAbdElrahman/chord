@@ -1,15 +1,20 @@
 # chord
 
-Compose local AI models as Unix filters — format in, format out. Each model
-reads one format on stdin and writes another on stdout, so you connect them with
-the shell pipe.
+Compose local AI models as Unix filters. Each transform reads an ordered list of
+typed parts (a *message*) on stdin and writes one on stdout, so you connect them
+with the shell pipe. In the common case a message is a single part of one
+modality, and the pipe carries it as raw bytes — so a stage stays a plain filter.
 
 ```sh
-cat question.wav | chord stt | chord chat | chord tts | aplay
+cat question.wav | chord stt | chord text | chord tts | aplay
 #                  audio→text   text→text    text→audio
 ```
 
-Everything runs locally.
+A transform is, in full generality, a function `message -> message`: an ordered
+list of typed parts in, an ordered list out. The mono-modal verbs (`stt`, `tts`,
+`text`, `see`, `draw`) are the one-part-in/one-part-out special case; `chat` is
+the general multimodal case — text, images, and audio in one prompt. Everything
+runs locally.
 
 ## Transforms
 
@@ -17,11 +22,16 @@ Everything runs locally.
 |--------|---------------|--------|
 | `stt`  | audio → text  | whisper.cpp (also `--backend llama.cpp` / `sherpa-onnx`) |
 | `tts`  | text → audio  | Supertonic / ONNX |
-| `chat` | text → text   | llama.cpp |
+| `text` | text → text   | llama.cpp (text generation / chat) |
+| `chat` | text · image · audio → text | mistral.rs (multimodal) |
 | `see`  | image → text  | llama.cpp (vision) |
 | `draw` | text → image  | stable-diffusion.cpp |
 | `redact` | text → text | ONNX (PII filter) |
+| `pack` · `unpack` | message ↔ parts | — (assemble / inspect multimodal messages) |
 | `vad` · `langid` · `diarize` | audio → text | sherpa-onnx |
+
+`text` is the lightweight text-only LLM (llama.cpp, GGUF); `chat` is the general
+multimodal model (mistral.rs) that takes text, images, and audio together.
 
 `chord ls` lists whatever engines are installed (engines are discovered, not
 hardcoded). `chord <verb> --help` shows a verb's flags; `--backend <id>` picks an
@@ -37,10 +47,13 @@ they land side-by-side in `~/.cargo/bin`, where `chord` finds them automatically
 cargo install --path crates/chord-cli            # the `chord` host
 cargo install --path crates/transforms/chord-stt
 cargo install --path crates/transforms/chord-tts
-cargo install --path crates/transforms/chord-chat
+cargo install --path crates/transforms/chord-text   # text-only LLM (llama.cpp)
+cargo install --path crates/transforms/chord-chat   # multimodal (mistral.rs)
 cargo install --path crates/transforms/chord-see
 cargo install --path crates/transforms/chord-draw
 cargo install --path crates/transforms/chord-redact
+cargo install --path crates/transforms/chord-pack
+cargo install --path crates/transforms/chord-unpack
 # audio building blocks + alternate stt backends (sherpa-onnx):
 cargo install --path crates/transforms/chord-vad
 cargo install --path crates/transforms/chord-langid
@@ -71,10 +84,10 @@ chord pull stt     # whisper large-v3-turbo (~1.5 GB) -> ~/.local/share/chord/mo
 
 A `--model hf:org/repo[:quant-or-file]` reference (or `chord pull --model hf:…`)
 pulls from the Hugging Face Hub into its cache. `draw` downloads its weights
-automatically on first use. For `chat`/`see` (large GGUFs) and `tts` (the
-Supertonic asset bundle), point the engine at a local model with `--model`/config
-(or `--assets` for tts). Each engine also honors a `$CHORD_<NAME>_MODEL` env
-override.
+automatically on first use. For `text`/`see` (large GGUFs), `chat` (mistral.rs
+models, e.g. a multimodal Gemma), and `tts` (the Supertonic asset bundle), point
+the engine at a local model with `--model`/config (or `--assets` for tts). Each
+engine also honors a `$CHORD_<NAME>_MODEL` env override.
 
 ## Syntax
 
@@ -91,12 +104,29 @@ chord <verb> [input] [--flags]
 ```sh
 # Describe an image, translate the answer, speak it
 chord see photo.jpg --prompt "what is this?" \
-  | chord chat --system "translate to German" \
+  | chord text --system "translate to German" \
   | chord tts | aplay
 
 # Text to image
 echo "a lighthouse at sunset" | chord draw --steps 6 > out.png
 ```
+
+### Multimodal messages
+
+`chat` takes several modalities in one prompt. Give it files directly, or build a
+message with `pack` and pipe it in:
+
+```sh
+# Files straight on the chat command
+chord chat --image cat.png --audio question.wav "Describe the image and answer the question"
+
+# Or assemble a message explicitly, then inspect or send it
+chord pack --image cat.png --text "what is this?" --audio q.wav | chord unpack --manifest
+chord pack --image cat.png --text "what is this?" --audio q.wav | chord chat
+```
+
+A single-part message is carried raw (so `chord draw > x.png` still works);
+multi-part messages are framed. `unpack --part N` extracts one part's bytes.
 
 ## Pipelines
 
@@ -104,7 +134,7 @@ Because every transform reads stdin and writes stdout, you compose them with the
 shell pipe — each stage is its own process:
 
 ```sh
-chord see photo.jpg --prompt "what is this?" | chord chat --system "translate to German" | chord tts
+chord see photo.jpg --prompt "what is this?" | chord text --system "translate to German" | chord tts
 ```
 
 ### The `pipeline` shortcut
@@ -113,7 +143,7 @@ chord see photo.jpg --prompt "what is this?" | chord chat --system "translate to
 `::`:
 
 ```sh
-chord pipeline see photo.jpg --prompt "what is this?" :: chat --system "translate to German" :: tts | aplay
+chord pipeline see photo.jpg --prompt "what is this?" :: text --system "translate to German" :: tts | aplay
 ```
 
 Each stage is `verb [flags]`, written exactly as you would on its own. The first
@@ -131,7 +161,7 @@ Per-transform defaults live in a YAML file, found in order: `--config <file>`,
 override the file. `chord config` shows what was resolved.
 
 ```yaml
-chat:
+text:
   model: ~/models/qwen3-8b.gguf
   system: "Be concise."
 ```
@@ -151,8 +181,11 @@ $ printf '' | chord tts --format jsonl
 
 ## Architecture
 
-The core (`crates/chord-core`) defines `Kind`, the `Transform` trait, a
-`Registry`, the plug-in `Manifest`, and the XDG path helpers — and nothing else.
+The core (`crates/chord-core`) defines `Kind`, `Message`/`Part` (the data plane
+and its wire codec), the `Transform` trait (`message -> message`) with the
+`Unary` convenience for 1→1 engines, a `Registry`, the plug-in `Manifest`, and
+the XDG path helpers — and nothing else. The wire codec writes a lone inline part
+as bare bytes (so mono-modal pipes stay raw) and frames multi-part messages.
 
 Every engine runs **out-of-process**: each is its own `chord-<name>` binary (a
 plain stdin → stdout filter) that links only its own native library. The host
@@ -168,8 +201,8 @@ engine list and no option tables duplicated in the host: an engine's own
 
 ```
 chord (host) ── discovers + queries ──┐
-  ├─ chord-stt --chord-manifest        │   {"name":"stt","backend":"whisper.cpp",…}
-  ├─ chord-chat --chord-manifest       │   {"name":"chat","backend":"llama.cpp",…}
+  ├─ chord-stt --chord-manifest        │   {"name":"stt","accepts":["audio"],"emits":["text"],…}
+  ├─ chord-chat --chord-manifest       │   {"name":"chat","backend":"mistral.rs",…}
   └─ …                                 ┘
         │
         └─ run: spawn the sibling binary, pipe bytes through it

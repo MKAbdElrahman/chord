@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
-use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Transform};
+use chord_core::{ChordError, Kind, Message, OptionSpec, Options, Result, Signature, Transform};
 
 use crate::discover::{self, Engine};
 
@@ -118,11 +118,8 @@ impl Transform for ExecProxy {
     fn name(&self) -> &str {
         self.engine.name
     }
-    fn from(&self) -> Kind {
-        self.engine.from
-    }
-    fn to(&self) -> Kind {
-        self.engine.to
+    fn signature(&self) -> Signature {
+        Signature::new(self.engine.accepts.clone(), self.engine.emits.clone())
     }
     fn describe(&self) -> &str {
         self.engine.describe
@@ -134,7 +131,7 @@ impl Transform for ExecProxy {
         self.engine.opts
     }
 
-    fn apply(&self, input: &mut dyn Read, output: &mut dyn Write, opts: &Options) -> Result<()> {
+    fn apply(&self, input: Message, opts: &Options) -> Result<Message> {
         let mut cmd = self.command(opts);
         // stderr is inherited so the child's spinner/errors reach the terminal.
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
@@ -145,11 +142,12 @@ impl Transform for ExecProxy {
             )
         })?;
 
-        // Read the input fully, then feed the child's stdin on a separate thread
-        // while we stream its stdout through. Decoupling the two directions means
-        // a child that emits output before consuming all input can't deadlock us.
+        // Encode the input message, feed the child's stdin on a separate thread
+        // while we read its stdout. Decoupling the two directions means a child
+        // that emits output before consuming all input can't deadlock us. The
+        // singleton-raw rule keeps a lone inline part on the wire as bare bytes.
         let mut buf = Vec::new();
-        input.read_to_end(&mut buf)?;
+        chord_core::encode(&input, &mut buf)?;
         let mut child_stdin = child.stdin.take().expect("piped stdin");
         let writer = std::thread::spawn(move || {
             let _ = child_stdin.write_all(&buf);
@@ -157,9 +155,10 @@ impl Transform for ExecProxy {
         });
 
         let mut child_out = child.stdout.take().expect("piped stdout");
-        let copy_res = std::io::copy(&mut child_out, output);
+        let mut out_buf = Vec::new();
+        let read_res = child_out.read_to_end(&mut out_buf);
         let _ = writer.join();
-        copy_res?;
+        read_res?;
 
         let status = child.wait()?;
         if !status.success() {
@@ -167,6 +166,10 @@ impl Transform for ExecProxy {
             // inherited stderr; carry its exit code up without repeating it.
             return Err(ChordError::Child(status.code().unwrap_or(1)).into());
         }
-        Ok(())
+
+        // A raw (unframed) child output decodes to one part of the engine's
+        // primary output kind; framed output (multi-part) decodes faithfully.
+        let default_kind = self.engine.emits.first().copied().unwrap_or(Kind::Text);
+        chord_core::decode(&mut out_buf.as_slice(), default_kind)
     }
 }

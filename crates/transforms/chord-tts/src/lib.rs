@@ -17,7 +17,7 @@ mod preprocess;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Transform};
+use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Unary};
 use ort::session::Session;
 
 const OPTS: &[OptionSpec] = &[
@@ -57,7 +57,7 @@ use serde::Deserialize;
 
 pub struct Tts;
 
-impl Transform for Tts {
+impl Unary for Tts {
     fn name(&self) -> &str {
         "tts"
     }

@@ -7,7 +7,7 @@
 //! forward pass. We run its ONNX export through ONNX Runtime (`ort`) with the
 //! repo's HF tokenizer, take the per-token argmax (the official decode; the
 //! upstream Viterbi pass is a span-coherence refinement), merge same-category
-//! spans, and replace each with a `[CATEGORY]` placeholder.
+//! spans, and replpleaace each with a `[CATEGORY]` placeholder.
 //!
 //! Options (via `-o key=value`):
 //!   - `model` — PII model: a local `.onnx` path, or an `hf:` reference to the
@@ -17,7 +17,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Transform};
+use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Unary};
 use ort::session::Session;
 use ort::value::Tensor;
 use tokenizers::Tokenizer;
@@ -33,7 +33,7 @@ const OPTS: &[OptionSpec] = &[OptionSpec {
 
 pub struct Redact;
 
-impl Transform for Redact {
+impl Unary for Redact {
     fn name(&self) -> &str {
         "redact"
     }

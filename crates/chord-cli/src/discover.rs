@@ -13,15 +13,17 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::UNIX_EPOCH;
 
-use chord_core::{dirs, Kind, Manifest, OptionSpec};
+use chord_core::{dirs, Kind, Manifest, OptionSpec, MANIFEST_VERSION};
 use serde::{Deserialize, Serialize};
 
 /// One installed engine, with all its metadata pre-leaked to `'static` so the
-/// host can hand out cheap `Copy` proxies that borrow from it.
+/// host can hand out cheap `Copy` proxies that borrow from it. (`accepts`/`emits`
+/// are owned `Vec`s; the `Engine` itself lives `'static` in the discovery cache,
+/// so borrows of its fields are `'static` too.)
 pub struct Engine {
     pub name: &'static str,
-    pub from: Kind,
-    pub to: Kind,
+    pub accepts: Vec<Kind>,
+    pub emits: Vec<Kind>,
     pub describe: &'static str,
     pub backend: &'static str,
     pub opts: &'static [OptionSpec],
@@ -84,8 +86,8 @@ fn engine_from(m: Manifest, bin: PathBuf, is_default: bool) -> Engine {
         .collect();
     Engine {
         name: leak(&m.name),
-        from: m.from,
-        to: m.to,
+        accepts: m.accepts,
+        emits: m.emits,
         describe: leak(&m.describe),
         backend: leak(&m.backend),
         opts: Box::leak(opts.into_boxed_slice()),
@@ -166,7 +168,9 @@ impl Cache {
         let mtime_ns = mtime_ns(bin)?;
         let key = bin.to_string_lossy().into_owned();
         if let Some(entry) = self.entries.get(&key) {
-            if entry.mtime_ns == mtime_ns {
+            // Ignore entries written by an older manifest schema (e.g. the
+            // pre-Message `from`/`to` shape) so the host re-queries the engine.
+            if entry.mtime_ns == mtime_ns && entry.manifest.version == MANIFEST_VERSION {
                 return Some(entry.manifest.clone());
             }
         }

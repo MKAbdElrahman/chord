@@ -13,9 +13,12 @@ members = [
     "crates/transforms/chord-langid",
     "crates/transforms/chord-redact",
     "crates/transforms/chord-tts",
+    "crates/transforms/chord-text",
     "crates/transforms/chord-chat",
     "crates/transforms/chord-see",
     "crates/transforms/chord-draw",
+    "crates/transforms/chord-pack",
+    "crates/transforms/chord-unpack",
 ]
 
 [workspace.package]

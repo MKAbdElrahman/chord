@@ -5,7 +5,7 @@
 
 use std::io::{Read, Write};
 
-use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Transform};
+use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Unary};
 use sherpa_rs::language_id::{SpokenLanguageId, SpokenLanguageIdConfig};
 
 const DEF_ENCODER: &str = "hf:csukuangfj/sherpa-onnx-whisper-tiny:tiny-encoder.onnx";
@@ -27,7 +27,7 @@ const OPTS: &[OptionSpec] = &[
 
 pub struct LangId;
 
-impl Transform for LangId {
+impl Unary for LangId {
     fn name(&self) -> &str {
         "langid"
     }

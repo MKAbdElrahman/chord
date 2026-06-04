@@ -14,7 +14,7 @@
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
-use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Transform};
+use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Unary};
 
 const OPTS: &[OptionSpec] = &[
     OptionSpec {
@@ -37,7 +37,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 pub struct Stt;
 
-impl Transform for Stt {
+impl Unary for Stt {
     fn name(&self) -> &str {
         "stt"
     }

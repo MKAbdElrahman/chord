@@ -5,7 +5,7 @@
 
 use std::io::{Read, Write};
 
-use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Transform};
+use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Unary};
 use sherpa_rs::silero_vad::{SileroVad, SileroVadConfig};
 
 const DEF_MODEL: &str = "hf:csukuangfj/vad:silero_vad.onnx";
@@ -41,7 +41,7 @@ const OPTS: &[OptionSpec] = &[
 
 pub struct Vad;
 
-impl Transform for Vad {
+impl Unary for Vad {
     fn name(&self) -> &str {
         "vad"
     }

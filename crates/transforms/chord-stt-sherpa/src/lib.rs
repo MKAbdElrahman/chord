@@ -8,7 +8,7 @@
 
 use std::io::{Read, Write};
 
-use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Transform};
+use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Unary};
 use sherpa_rs::transducer::{TransducerConfig, TransducerRecognizer};
 
 const REPO: &str = "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8";
@@ -55,7 +55,7 @@ const OPTS: &[OptionSpec] = &[
 
 pub struct SttSherpa;
 
-impl Transform for SttSherpa {
+impl Unary for SttSherpa {
     fn name(&self) -> &str {
         "stt"
     }

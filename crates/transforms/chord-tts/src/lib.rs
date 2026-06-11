@@ -50,8 +50,13 @@ const OPTS: &[OptionSpec] = &[
         takes_value: true,
     },
     OptionSpec {
+        key: "model",
+        help: "model bundle: the Supertonic assets directory (default <XDG data>/chord/tts/assets)",
+        takes_value: true,
+    },
+    OptionSpec {
         key: "assets",
-        help: "Supertonic assets directory",
+        help: "deprecated alias of --model",
         takes_value: true,
     },
     OptionSpec {
@@ -92,6 +97,7 @@ impl Unary for Tts {
         let silence: f32 = opts.get_or("silence", "0.3").parse().unwrap_or(0.3);
 
         let engine = engine_for(opts)?;
+        let style = style_for(opts)?;
         let mut engine = engine
             .lock()
             .map_err(|_| ChordError::Engine("tts engine lock poisoned".into()))?;
@@ -133,6 +139,7 @@ impl Unary for Tts {
             while let Some(chunk) = preprocess::take_stream_chunk(&mut pending, max_len) {
                 synth_chunk(
                     &mut engine,
+                    &style,
                     output,
                     &chunk,
                     &lang,
@@ -150,6 +157,7 @@ impl Unary for Tts {
         for chunk in preprocess::chunk_text(pending.trim(), max_len) {
             synth_chunk(
                 &mut engine,
+                &style,
                 output,
                 &chunk,
                 &lang,
@@ -212,25 +220,30 @@ impl TensorJson {
     }
 }
 
+/// A speaker style — the voice — decoupled from the networks so switching
+/// voices never reloads the ONNX sessions.
+struct Style {
+    ttl: (Vec<i64>, Vec<f32>),
+    dp: (Vec<i64>, Vec<f32>),
+}
+
 struct Engine {
     cfg: Cfg,
     indexer: Vec<i64>,
-    ttl: (Vec<i64>, Vec<f32>),
-    dp_style: (Vec<i64>, Vec<f32>),
     dp: Session,
     text_enc: Session,
     vector_est: Session,
     vocoder: Session,
 }
 
-/// Loaded engines, memoized per process by (assets dir, voice): the first
-/// apply pays the ONNX session setup; every later one (the `--each` batch
-/// loop) reuses it (rule R5 in chord's docs/theory/THEORY.md).
-type EngineKey = (PathBuf, String);
-static ENGINES: OnceLock<Mutex<HashMap<EngineKey, Arc<Mutex<Engine>>>>> = OnceLock::new();
+/// Two-level memoization (rule R5): the expensive ONNX sessions are cached
+/// per model bundle; the cheap speaker styles per voice file. A multi-voice
+/// batch loads the networks once and switches styles for free.
+static ENGINES: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<Engine>>>>> = OnceLock::new();
+static STYLES: OnceLock<Mutex<HashMap<PathBuf, Arc<Style>>>> = OnceLock::new();
 
 fn engine_for(opts: &Options) -> Result<Arc<Mutex<Engine>>> {
-    let key = (resolve_assets(opts), opts.get_or("voice", "M1").to_string());
+    let key = resolve_assets(opts);
     let cache = ENGINES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache
         .lock()
@@ -243,6 +256,24 @@ fn engine_for(opts: &Options) -> Result<Arc<Mutex<Engine>>> {
     Ok(e)
 }
 
+fn style_for(opts: &Options) -> Result<Arc<Style>> {
+    let key = resolve_voice(opts.get_or("voice", "M1"), &resolve_assets(opts));
+    let cache = STYLES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| ChordError::Engine("tts style cache poisoned".into()))?;
+    if let Some(st) = cache.get(&key) {
+        return Ok(st.clone());
+    }
+    let parsed: StyleJson = serde_json::from_str(&read(&key)?)?;
+    let st = Arc::new(Style {
+        ttl: parsed.style_ttl.flatten(),
+        dp: parsed.style_dp.flatten(),
+    });
+    cache.insert(key, st.clone());
+    Ok(st)
+}
+
 impl Engine {
     fn load(opts: &Options) -> Result<Engine> {
         let assets = resolve_assets(opts);
@@ -251,11 +282,6 @@ impl Engine {
         let cfg: Cfg = serde_json::from_str(&read(onnx.join("tts.json"))?)?;
         let indexer: Vec<i64> = serde_json::from_str(&read(onnx.join("unicode_indexer.json"))?)?;
 
-        let voice = resolve_voice(opts.get_or("voice", "M1"), &assets);
-        let style: StyleJson = serde_json::from_str(&read(&voice)?)?;
-        let ttl = style.style_ttl.flatten();
-        let dp_style = style.style_dp.flatten();
-
         let session = |name: &str| -> Result<Session> {
             Ok(Session::builder()?.commit_from_file(onnx.join(name))?)
         };
@@ -263,8 +289,6 @@ impl Engine {
         Ok(Engine {
             cfg,
             indexer,
-            ttl,
-            dp_style,
             dp: session("duration_predictor.onnx")?,
             text_enc: session("text_encoder.onnx")?,
             vector_est: session("vector_estimator.onnx")?,
@@ -280,6 +304,7 @@ impl Engine {
         lang: &str,
         steps: usize,
         speed: f32,
+        style: &Style,
     ) -> Result<(Vec<f32>, f32)> {
         let ids = preprocess::text_to_ids(text, lang, &self.indexer);
         let l = ids.len() as i64;
@@ -288,7 +313,7 @@ impl Engine {
         // Duration predictor -> seconds.
         let dur_out = {
             let ids_t = Tensor::from_array((vec![1, l], ids.clone()))?;
-            let style_t = Tensor::from_array((self.dp_style.0.clone(), self.dp_style.1.clone()))?;
+            let style_t = Tensor::from_array((style.dp.0.clone(), style.dp.1.clone()))?;
             let mask_t = Tensor::from_array((vec![1, 1, l], text_mask.clone()))?;
             let outputs = self.dp.run(ort::inputs![
                 "text_ids" => ids_t, "style_dp" => style_t, "text_mask" => mask_t
@@ -301,7 +326,7 @@ impl Engine {
         // Text encoder -> text embedding (constant across denoise steps).
         let (emb_shape, emb_data) = {
             let ids_t = Tensor::from_array((vec![1, l], ids.clone()))?;
-            let style_t = Tensor::from_array((self.ttl.0.clone(), self.ttl.1.clone()))?;
+            let style_t = Tensor::from_array((style.ttl.0.clone(), style.ttl.1.clone()))?;
             let mask_t = Tensor::from_array((vec![1, 1, l], text_mask.clone()))?;
             let outputs = self.text_enc.run(ort::inputs![
                 "text_ids" => ids_t, "style_ttl" => style_t, "text_mask" => mask_t
@@ -328,7 +353,7 @@ impl Engine {
         for step in 0..steps {
             let noisy = Tensor::from_array((latent_shape.clone(), xt.clone()))?;
             let emb = Tensor::from_array((emb_shape.clone(), emb_data.clone()))?;
-            let style_t = Tensor::from_array((self.ttl.0.clone(), self.ttl.1.clone()))?;
+            let style_t = Tensor::from_array((style.ttl.0.clone(), style.ttl.1.clone()))?;
             let lmask = Tensor::from_array((vec![1, 1, latent_len as i64], latent_mask.clone()))?;
             let tmask = Tensor::from_array((vec![1, 1, l], text_mask.clone()))?;
             let cur = Tensor::from_array((vec![1], vec![step as f32]))?;
@@ -360,6 +385,11 @@ impl Engine {
 }
 
 fn resolve_assets(opts: &Options) -> PathBuf {
+    // `model` is the cross-engine convention for an engine's weights
+    // (docs/CONVENTIONS.md); `assets` is the deprecated Supertonic-quirk alias.
+    if let Some(m) = opts.get("model") {
+        return PathBuf::from(m);
+    }
     if let Some(a) = opts.get("assets") {
         return PathBuf::from(a);
     }
@@ -391,6 +421,7 @@ fn read(path: impl AsRef<Path>) -> Result<String> {
 #[allow(clippy::too_many_arguments)]
 fn synth_chunk(
     engine: &mut Engine,
+    style: &Style,
     output: &mut dyn Write,
     chunk: &str,
     lang: &str,
@@ -406,7 +437,7 @@ fn synth_chunk(
         let gap = (silence * sr as f32) as usize;
         write_pcm(output, &vec![0.0_f32; gap])?;
     }
-    let (wav, dur) = engine.infer(chunk, lang, steps, speed)?;
+    let (wav, dur) = engine.infer(chunk, lang, steps, speed, style)?;
     let n = ((sr as f32) * dur) as usize;
     write_pcm(output, &wav[..n.min(wav.len())])?;
     output.flush()?;
@@ -475,6 +506,20 @@ impl Rng {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_option_names_the_bundle_and_wins_over_deprecated_assets() {
+        // The cross-engine convention (docs/CONVENTIONS.md): every engine's
+        // weights are named by the `model` key; `assets` is a deprecated alias.
+        let mut opts = Options::new();
+        opts.insert("model", "/bundles/super-v2");
+        opts.insert("assets", "/old/location");
+        assert_eq!(resolve_assets(&opts), PathBuf::from("/bundles/super-v2"));
+
+        let mut old = Options::new();
+        old.insert("assets", "/old/location");
+        assert_eq!(resolve_assets(&old), PathBuf::from("/old/location"));
+    }
 
     #[test]
     fn stream_header_is_a_valid_unknown_length_wav_preamble() {

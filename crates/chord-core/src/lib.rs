@@ -28,7 +28,7 @@ mod transform;
 pub use error::ChordError;
 pub use kind::Kind;
 pub use manifest::{Manifest, ManifestOption, MANIFEST_VERSION};
-pub use message::{decode, encode, Body, Message, Part};
+pub use message::{decode, encode, is_framed, Body, Message, Part, MAGIC_LEN};
 pub use registry::Registry;
 pub use transform::{OptionSpec, Options, Signature, Transform, Unary};
 

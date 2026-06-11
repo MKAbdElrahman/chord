@@ -33,6 +33,17 @@ use crate::{ChordError, Kind, Result};
 /// disjoint from text and from common media file signatures.
 const MAGIC: [u8; 6] = [0x00, b'C', b'H', b'R', b'D', 0x01];
 
+/// Length of the frame discriminator: how many leading bytes a consumer must
+/// peek to tell a framed message from a raw payload.
+pub const MAGIC_LEN: usize = MAGIC.len();
+
+/// True when `prefix` — the first bytes of a stream — begins a framed
+/// message. A prefix shorter than the magic is necessarily raw, so peeking
+/// [`MAGIC_LEN`] bytes (or hitting EOF first) always decides.
+pub fn is_framed(prefix: &[u8]) -> bool {
+    prefix.len() >= MAGIC_LEN && prefix[..MAGIC_LEN] == MAGIC
+}
+
 /// Where a part's bytes live.
 #[derive(Debug, Clone)]
 pub enum Body {
@@ -381,6 +392,25 @@ mod tests {
     fn empty_roundtrips() {
         let back = roundtrip(&Message::empty(), Kind::Text);
         assert!(back.is_empty());
+    }
+
+    #[test]
+    fn framed_prefix_is_detected() {
+        let msg = Message {
+            parts: vec![Part::text("a"), Part::text("b")],
+        };
+        let mut buf = Vec::new();
+        encode(&msg, &mut buf).unwrap();
+        assert!(is_framed(&buf));
+        assert!(is_framed(&MAGIC));
+    }
+
+    #[test]
+    fn raw_and_short_prefixes_are_not_framed() {
+        assert!(!is_framed(b"hello, this is plain text"));
+        assert!(!is_framed(b""));
+        assert!(!is_framed(&MAGIC[..3])); // shorter than the magic is necessarily raw
+        assert!(!is_framed(&[0x89, b'P', b'N', b'G'])); // media magic, not ours
     }
 
     #[test]

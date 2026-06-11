@@ -108,6 +108,11 @@ impl Signature {
 /// 1. **Stateless across calls** — the value holds config, not per-request state.
 /// 2. **Signature honesty** — [`signature`](Transform::signature) must be accurate.
 /// 3. **Options are advisory** — ignore unknown keys; default missing ones.
+/// 4. **Lazy resources** — load models/weights inside `apply`, on first
+///    demand, never at construction or process start. This keeps a chord
+///    pipeline's peak memory at ~one model for single-message runs and lets
+///    loads overlap upstream compute once stages stream (working-set and
+///    call-by-need rules R3/R4 — see `docs/theory/THEORY.md`).
 ///
 /// Mono-modal engines should implement [`Unary`] instead — the blanket impl
 /// below lifts them into this trait for free.
@@ -135,6 +140,28 @@ pub trait Transform: Send + Sync {
 
     /// Transform an input message into an output message.
     fn apply(&self, input: Message, opts: &Options) -> Result<Message>;
+
+    /// Apply this transform to a **raw** (unframed) input stream, writing the
+    /// output stream directly.
+    ///
+    /// The runner calls this when the input carries no frame magic — the
+    /// singleton-raw case that dominates mono-modal pipes. The default
+    /// buffers (decode the whole stream as one part of the primary input
+    /// kind, apply, encode); the [`Unary`] blanket impl overrides it to pass
+    /// the streams straight through, so the glue never buffers what the
+    /// kernel doesn't need (rule R2 in `docs/theory/THEORY.md`). An engine
+    /// that needs the whole input (e.g. whisper) still buffers *inside* its
+    /// body — that's the stage's choice, not the plumbing's.
+    fn apply_raw(
+        &self,
+        input: &mut dyn Read,
+        output: &mut dyn Write,
+        opts: &Options,
+    ) -> Result<()> {
+        let msg = crate::message::decode(input, self.signature().primary_in())?;
+        let out = self.apply(msg, opts)?;
+        crate::message::encode(&out, output)
+    }
 }
 
 /// A 1→1 transform: exactly one input part of one [`Kind`], exactly one output
@@ -202,11 +229,142 @@ impl<T: Unary> Transform for T {
         Unary::apply(self, &mut rd, &mut out, opts)?;
         Ok(Message::one(Part::new(to, out)))
     }
+
+    /// The streaming fast path: a `Unary` body is already stream-shaped
+    /// (`Read` in, `Write` out), so a raw singleton flows straight through
+    /// with no glue-level buffering. The output is the raw payload bytes —
+    /// exactly what encoding the single output part would produce.
+    fn apply_raw(
+        &self,
+        input: &mut dyn Read,
+        output: &mut dyn Write,
+        opts: &Options,
+    ) -> Result<()> {
+        Unary::apply(self, input, output, opts)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+
+    /// A reader that yields `data` and then **fails** instead of reporting EOF.
+    /// Proves whether a code path drained the stream (buffered) or read only
+    /// what it needed (streamed) — see THEORY.md rule R2.
+    struct PoisonedTail {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl PoisonedTail {
+        fn new(data: &[u8]) -> Self {
+            PoisonedTail {
+                data: data.to_vec(),
+                pos: 0,
+            }
+        }
+    }
+
+    impl Read for PoisonedTail {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.pos == self.data.len() {
+                return Err(io::Error::other("read past the poisoned tail"));
+            }
+            let n = buf.len().min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    /// A streaming engine that uppercases at most the first 8 bytes and
+    /// deliberately does not drain its input.
+    struct Head8;
+
+    impl Unary for Head8 {
+        fn name(&self) -> &str {
+            "head8"
+        }
+        fn from(&self) -> Kind {
+            Kind::Text
+        }
+        fn to(&self) -> Kind {
+            Kind::Text
+        }
+        fn describe(&self) -> &str {
+            "test: uppercase first 8 bytes"
+        }
+        fn apply(&self, input: &mut dyn Read, output: &mut dyn Write, _o: &Options) -> Result<()> {
+            let mut buf = Vec::new();
+            input.take(8).read_to_end(&mut buf)?;
+            output.write_all(&buf.to_ascii_uppercase())?;
+            Ok(())
+        }
+    }
+
+    /// A whole-message transform: replies with its input's part count.
+    struct CountParts;
+
+    impl Transform for CountParts {
+        fn name(&self) -> &str {
+            "count"
+        }
+        fn signature(&self) -> Signature {
+            Signature::unary(Kind::Text, Kind::Text)
+        }
+        fn describe(&self) -> &str {
+            "test: count parts"
+        }
+        fn apply(&self, input: Message, _o: &Options) -> Result<Message> {
+            Ok(Message::one(Part::text(input.parts.len().to_string())))
+        }
+    }
+
+    #[test]
+    fn unary_apply_raw_streams_without_draining_input() {
+        // Exactly 8 readable bytes, then poison: only a true streaming path
+        // (no glue-level read_to_end) can succeed here.
+        let mut input = PoisonedTail::new(b"hello wo");
+        let mut out = Vec::new();
+        Head8
+            .apply_raw(&mut input, &mut out, &Options::new())
+            .unwrap();
+        assert_eq!(out, b"HELLO WO");
+    }
+
+    #[test]
+    fn default_apply_raw_buffers_the_whole_stream() {
+        // The default path decodes a whole message, so it must drain the
+        // stream and hit the poison. Documents the buffered default.
+        let mut input = PoisonedTail::new(b"hello wo");
+        let mut out = Vec::new();
+        assert!(CountParts
+            .apply_raw(&mut input, &mut out, &Options::new())
+            .is_err());
+    }
+
+    #[test]
+    fn default_apply_raw_wraps_raw_bytes_as_one_part() {
+        let mut input = io::Cursor::new(b"some raw text".to_vec());
+        let mut out = Vec::new();
+        CountParts
+            .apply_raw(&mut input, &mut out, &Options::new())
+            .unwrap();
+        assert_eq!(out, b"1");
+    }
+
+    #[test]
+    fn default_apply_raw_empty_input_is_an_empty_message() {
+        // Source transforms (e.g. pack) rely on empty stdin meaning an empty
+        // Message, not a message with one empty part.
+        let mut input = io::Cursor::new(Vec::new());
+        let mut out = Vec::new();
+        CountParts
+            .apply_raw(&mut input, &mut out, &Options::new())
+            .unwrap();
+        assert_eq!(out, b"0");
+    }
 
     #[test]
     fn mismatched_unary_stages_do_not_connect() {

@@ -304,8 +304,14 @@ fn check_pipeline_kinds(stages: &[(&str, Signature)]) -> Result<()> {
 /// `::`; each stage is `transform [flags…]`. Every stage's engine process is
 /// spawned at once and wired with OS pipes (stage N's stdout *is* stage N+1's
 /// stdin), so bytes flow kernel-to-kernel and the stages run concurrently —
-/// exactly like a shell `a | b | c`. The first stage reads its file arg, literal
-/// text, or our stdin; the last writes our stdout.
+/// exactly like a shell `a | b | c`.
+///
+/// This is a Kahn process network (sequential processes, FIFO channels,
+/// blocking reads), so the output is deterministic regardless of how the OS
+/// schedules the stages — the theorem that licenses spawning everything up
+/// front. Models still load one stage at a time, because engines load lazily
+/// on first input (rules R1–R4 in `docs/theory/THEORY.md`). The first stage
+/// reads its file arg, literal text, or our stdin; the last writes our stdout.
 fn run_pipeline(m: &ArgMatches, config: &Config) -> Result<()> {
     let tokens: Vec<String> = m
         .get_many::<String>("stages")

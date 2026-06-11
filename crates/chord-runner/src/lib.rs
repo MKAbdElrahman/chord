@@ -16,7 +16,7 @@
 //! exec-proxy in `chord-cli`). Flag names here therefore mirror the options the
 //! proxy forwards.
 
-use std::io::{self, IsTerminal};
+use std::io::{self, Cursor, IsTerminal, Read, Write};
 use std::process::ExitCode;
 
 use chord_core::events;
@@ -65,26 +65,20 @@ pub fn run(t: &dyn Transform) -> ExitCode {
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    // A raw (unframed) input decodes to a single part of this transform's
-    // primary input kind; the singleton-raw rule keeps mono-modal pipes clean.
-    let default_kind = t.signature().primary_in();
 
     let result = (|| -> chord_core::Result<()> {
-        let input = match matches.get_one::<String>("input") {
+        match matches.get_one::<String>("input") {
             Some(path) if path != "-" => {
                 let mut f = std::fs::File::open(path)
                     .map_err(|e| -> chord_core::Error { format!("opening {path}: {e}").into() })?;
-                chord_core::decode(&mut f, default_kind)?
+                filter(t, &mut f, &mut out, &opts)
             }
             _ => {
                 let stdin = io::stdin();
                 let mut input = stdin.lock();
-                chord_core::decode(&mut input, default_kind)?
+                filter(t, &mut input, &mut out, &opts)
             }
-        };
-        let output = t.apply(input, &opts)?;
-        chord_core::encode(&output, &mut out)?;
-        Ok(())
+        }
     })();
 
     match result {
@@ -111,6 +105,44 @@ pub fn run(t: &dyn Transform) -> ExitCode {
             }
             ExitCode::from(code as u8)
         }
+    }
+}
+
+/// Run `t` over one input stream: peek the frame discriminator, then either
+/// hand a raw stream to the transform's streaming path ([`Transform::apply_raw`])
+/// or decode a framed message (buffered). The glue holds only the
+/// discriminator prefix, never the stream — rule R2 in `docs/theory/THEORY.md`.
+pub fn filter(
+    t: &dyn Transform,
+    input: &mut dyn Read,
+    output: &mut dyn Write,
+    opts: &Options,
+) -> chord_core::Result<()> {
+    // Peek exactly enough leading bytes to tell framed from raw. EOF before
+    // a full magic means the stream is raw (or empty).
+    let mut head = [0u8; chord_core::MAGIC_LEN];
+    let mut n = 0;
+    while n < head.len() {
+        match input.read(&mut head[n..]) {
+            Ok(0) => break,
+            Ok(r) => n += r,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let mut rest = Cursor::new(head[..n].to_vec()).chain(input);
+    if n == 0 || chord_core::is_framed(&head[..n]) {
+        // Framed (multi-part) — or empty, which must stay an empty Message so
+        // source transforms keep their flags-only behavior. Buffered path:
+        // decode the whole message, apply, encode.
+        let msg = chord_core::decode(&mut rest, t.signature().primary_in())?;
+        let out = t.apply(msg, opts)?;
+        chord_core::encode(&out, output)
+    } else {
+        // Raw singleton: stream straight through. Unary engines never buffer
+        // in the glue; whole-message transforms fall back to the buffered
+        // default impl of apply_raw.
+        t.apply_raw(&mut rest, output, opts)
     }
 }
 
@@ -164,4 +196,110 @@ fn build_command(t: &dyn Transform) -> Command {
             .default_value("text")
             .help("output format: text, or jsonl for lifecycle/error events on stderr"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chord_core::{encode, Kind, Message, Part, Result, Signature};
+    use std::io::{Cursor, Read, Write};
+
+    /// A streaming engine: uppercases whatever flows through.
+    struct Upper;
+
+    impl chord_core::Unary for Upper {
+        fn name(&self) -> &str {
+            "upper"
+        }
+        fn from(&self) -> Kind {
+            Kind::Text
+        }
+        fn to(&self) -> Kind {
+            Kind::Text
+        }
+        fn describe(&self) -> &str {
+            "test: uppercase"
+        }
+        fn apply(&self, input: &mut dyn Read, output: &mut dyn Write, _o: &Options) -> Result<()> {
+            let mut s = String::new();
+            input.read_to_string(&mut s)?;
+            output.write_all(s.to_uppercase().as_bytes())?;
+            Ok(())
+        }
+    }
+
+    /// A whole-message engine: replies with its input's part count.
+    struct CountParts;
+
+    impl Transform for CountParts {
+        fn name(&self) -> &str {
+            "count"
+        }
+        fn signature(&self) -> Signature {
+            Signature::unary(Kind::Text, Kind::Text)
+        }
+        fn describe(&self) -> &str {
+            "test: count parts"
+        }
+        fn apply(&self, input: Message, _o: &Options) -> Result<Message> {
+            Ok(Message::one(Part::text(input.parts.len().to_string())))
+        }
+    }
+
+    fn run_filter(t: &dyn Transform, input: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        filter(
+            t,
+            &mut Cursor::new(input.to_vec()),
+            &mut out,
+            &Options::new(),
+        )
+        .unwrap();
+        out
+    }
+
+    #[test]
+    fn raw_input_takes_the_streaming_path() {
+        assert_eq!(run_filter(&Upper, b"hello"), b"HELLO");
+    }
+
+    #[test]
+    fn raw_input_shorter_than_the_magic_still_works() {
+        assert_eq!(run_filter(&Upper, b"hi"), b"HI");
+    }
+
+    #[test]
+    fn framed_input_decodes_every_part() {
+        let msg = Message {
+            parts: vec![Part::text("a"), Part::text("b"), Part::text("c")],
+        };
+        let mut framed = Vec::new();
+        encode(&msg, &mut framed).unwrap();
+        assert_eq!(run_filter(&CountParts, &framed), b"3");
+    }
+
+    #[test]
+    fn framed_singleton_reaches_a_unary_through_apply() {
+        // A framed one-part message must still feed a Unary correctly
+        // (via the buffered decode -> apply path, not apply_raw).
+        let msg = Message {
+            parts: vec![
+                Part::text("ok").with_meta("origin", "test"),
+                Part::text("go"),
+            ],
+        };
+        let mut framed = Vec::new();
+        encode(&msg, &mut framed).unwrap();
+        // Two text parts -> Unary's single() contract rejects it cleanly.
+        let mut out = Vec::new();
+        let err = filter(&Upper, &mut Cursor::new(framed), &mut out, &Options::new()).unwrap_err();
+        assert!(err.to_string().contains("expected one text part"), "{err}");
+    }
+
+    #[test]
+    fn empty_input_is_an_empty_message_not_an_empty_part() {
+        // Source transforms (pack) build output from flags alone; empty stdin
+        // must reach apply as Message::empty().
+        assert_eq!(run_filter(&CountParts, b""), b"0");
+    }
 }

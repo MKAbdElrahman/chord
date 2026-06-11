@@ -214,7 +214,46 @@ fn resolve_model_spec(spec: Option<String>) -> Result<PathBuf> {
 }
 
 /// Decode WAV bytes to mono f32 samples at 16 kHz (what whisper expects).
+/// Patch the RIFF/data sizes of a *streaming* WAV (0xFFFFFFFF — the
+/// unknown-length convention of live sources) to the true sizes computed
+/// from the buffer we hold. No-op when sizes are already exact.
+fn normalize_streaming_wav(bytes: &mut [u8]) {
+    if bytes.len() < 44 || &bytes[..4] != b"RIFF" {
+        return;
+    }
+    if bytes[4..8] == [0xFF; 4] {
+        let riff = (bytes.len() as u32).saturating_sub(8).to_le_bytes();
+        bytes[4..8].copy_from_slice(&riff);
+    }
+    // Walk the chunk list to the `data` chunk and patch its size.
+    let mut off = 12;
+    while off + 8 <= bytes.len() {
+        let size = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+        if &bytes[off..off + 4] == b"data" {
+            if size == u32::MAX {
+                let real = (bytes.len() - off - 8) as u32;
+                bytes[off + 4..off + 8].copy_from_slice(&real.to_le_bytes());
+            }
+            return;
+        }
+        if size == u32::MAX {
+            return; // malformed: an unknown-size non-data chunk
+        }
+        off += 8 + size as usize + (size as usize & 1);
+    }
+}
+
 fn decode_wav_to_16k_mono(bytes: &[u8]) -> Result<Vec<f32>> {
+    // A streaming producer (chord-tts, ffmpeg pipes) writes unknown-length
+    // sizes; we hold the complete stream, so patch them before hound parses.
+    let mut owned;
+    let bytes = if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && bytes[4..8] == [0xFF; 4] {
+        owned = bytes.to_vec();
+        normalize_streaming_wav(&mut owned);
+        &owned[..]
+    } else {
+        bytes
+    };
     let mut reader = hound::WavReader::new(std::io::Cursor::new(bytes))?;
     let spec = reader.spec();
     let channels = spec.channels.max(1) as usize;
@@ -263,4 +302,58 @@ fn resample_linear(input: &[f32], from: u32, to: u32) -> Vec<f32> {
         out.push(a + (b - a) * frac);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal streaming WAV: unknown-size header + n silent 16-bit samples.
+    fn streaming_wav(sample_rate: u32, n_samples: usize) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&[0xFF; 4]);
+        b.extend_from_slice(b"WAVE");
+        b.extend_from_slice(b"fmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        b.extend_from_slice(&1u16.to_le_bytes()); // mono
+        b.extend_from_slice(&sample_rate.to_le_bytes());
+        b.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&16u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&[0xFF; 4]);
+        b.extend(std::iter::repeat_n(0u8, n_samples * 2));
+        b
+    }
+
+    #[test]
+    fn streaming_wav_sizes_are_patched_to_true_values() {
+        let mut bytes = streaming_wav(16000, 1600);
+        normalize_streaming_wav(&mut bytes);
+        let riff = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        assert_eq!(riff as usize, bytes.len() - 8);
+        let data = u32::from_le_bytes(bytes[40..44].try_into().unwrap());
+        assert_eq!(data as usize, 1600 * 2);
+    }
+
+    #[test]
+    fn streaming_wav_decodes_after_normalization() {
+        // The full decode path must accept a streaming (unknown-size) WAV —
+        // this is what keeps `chord tts :: stt` working once tts streams.
+        let bytes = streaming_wav(16000, 1600);
+        let samples = decode_wav_to_16k_mono(&bytes).unwrap();
+        assert_eq!(samples.len(), 1600);
+        assert!(samples.iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn exact_size_wav_is_left_untouched() {
+        let mut bytes = streaming_wav(16000, 100);
+        normalize_streaming_wav(&mut bytes); // patch once
+        let before = bytes.clone();
+        normalize_streaming_wav(&mut bytes); // idempotent on exact sizes
+        assert_eq!(bytes, before);
+    }
 }

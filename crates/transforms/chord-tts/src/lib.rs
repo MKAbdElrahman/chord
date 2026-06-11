@@ -54,6 +54,11 @@ const OPTS: &[OptionSpec] = &[
         help: "Supertonic assets directory",
         takes_value: true,
     },
+    OptionSpec {
+        key: "chunk",
+        help: "max characters per synthesis chunk; smaller starts audio sooner (default 300, ko/ja 120)",
+        takes_value: true,
+    },
 ];
 use ort::value::Tensor;
 use serde::Deserialize;
@@ -99,26 +104,35 @@ impl Unary for Tts {
             .map_err(|_| ChordError::Engine("tts engine lock poisoned".into()))?;
         let sr = engine.cfg.ae.sample_rate;
 
-        let max_len = if lang == "ko" || lang == "ja" {
+        let default_len = if lang == "ko" || lang == "ja" {
             120
         } else {
             300
         };
+        let max_len = opts
+            .get("chunk")
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or(default_len);
         let chunks = preprocess::chunk_text(text, max_len);
 
-        let mut wav_all: Vec<f32> = Vec::new();
+        // Stream: unknown-length WAV header first (the live-source
+        // convention), then each chunk's samples the moment they're
+        // synthesized, flushed — so a downstream player starts on chunk 1
+        // while chunk 2 is still computing (rule R2, engine half).
+        write_wav_stream_header(output, sr as u32)?;
         for (i, chunk) in chunks.iter().enumerate() {
             let (wav, dur) = engine.infer(chunk, &lang, steps, speed)?;
             let n = ((sr as f32) * dur) as usize;
             let clip = &wav[..n.min(wav.len())];
             if i > 0 {
                 let gap = (silence * sr as f32) as usize;
-                wav_all.extend(std::iter::repeat_n(0.0_f32, gap));
+                write_pcm(output, &vec![0.0_f32; gap])?;
             }
-            wav_all.extend_from_slice(clip);
+            write_pcm(output, clip)?;
+            output.flush()?;
         }
-
-        write_wav(output, &wav_all, sr as u32)
+        Ok(())
     }
 }
 
@@ -180,7 +194,8 @@ struct Engine {
 /// Loaded engines, memoized per process by (assets dir, voice): the first
 /// apply pays the ONNX session setup; every later one (the `--each` batch
 /// loop) reuses it (rule R5 in chord's docs/theory/THEORY.md).
-static ENGINES: OnceLock<Mutex<HashMap<(PathBuf, String), Arc<Mutex<Engine>>>>> = OnceLock::new();
+type EngineKey = (PathBuf, String);
+static ENGINES: OnceLock<Mutex<HashMap<EngineKey, Arc<Mutex<Engine>>>>> = OnceLock::new();
 
 fn engine_for(opts: &Options) -> Result<Arc<Mutex<Engine>>> {
     let key = (resolve_assets(opts), opts.get_or("voice", "M1").to_string());
@@ -338,23 +353,33 @@ fn read(path: impl AsRef<Path>) -> Result<String> {
 
 // ---- WAV output -------------------------------------------------------------
 
-fn write_wav(output: &mut dyn Write, samples: &[f32], sample_rate: u32) -> Result<()> {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut buf = std::io::Cursor::new(Vec::<u8>::new());
-    {
-        let mut writer = hound::WavWriter::new(&mut buf, spec)?;
-        for &s in samples {
-            let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-            writer.write_sample(v)?;
-        }
-        writer.finalize()?;
+/// WAV header for a stream of unknown length: RIFF and data sizes are
+/// 0xFFFFFFFF (the ffmpeg/sox live-source convention). 16-bit mono PCM.
+fn write_wav_stream_header(output: &mut dyn Write, sample_rate: u32) -> Result<()> {
+    let byte_rate = sample_rate * 2;
+    output.write_all(b"RIFF")?;
+    output.write_all(&[0xFF; 4])?;
+    output.write_all(b"WAVE")?;
+    output.write_all(b"fmt ")?;
+    output.write_all(&16u32.to_le_bytes())?;
+    output.write_all(&1u16.to_le_bytes())?; // PCM
+    output.write_all(&1u16.to_le_bytes())?; // mono
+    output.write_all(&sample_rate.to_le_bytes())?;
+    output.write_all(&byte_rate.to_le_bytes())?;
+    output.write_all(&2u16.to_le_bytes())?; // block align
+    output.write_all(&16u16.to_le_bytes())?; // bits per sample
+    output.write_all(b"data")?;
+    output.write_all(&[0xFF; 4])?;
+    Ok(())
+}
+
+/// Append f32 samples as 16-bit little-endian PCM.
+fn write_pcm(output: &mut dyn Write, samples: &[f32]) -> Result<()> {
+    let mut buf = Vec::with_capacity(samples.len() * 2);
+    for &s in samples {
+        buf.extend_from_slice(&((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
     }
-    output.write_all(&buf.into_inner())?;
+    output.write_all(&buf)?;
     Ok(())
 }
 
@@ -384,5 +409,42 @@ impl Rng {
         let u1 = self.next_f64().max(1e-10);
         let u2 = self.next_f64();
         ((-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()) as f32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_header_is_a_valid_unknown_length_wav_preamble() {
+        // The streaming convention (ffmpeg/sox): RIFF and data sizes are
+        // 0xFFFFFFFF because a live source can't know its length. 44 bytes,
+        // 16-bit mono PCM at the given rate.
+        let mut buf = Vec::new();
+        write_wav_stream_header(&mut buf, 44100).unwrap();
+        assert_eq!(buf.len(), 44);
+        assert_eq!(&buf[..4], b"RIFF");
+        assert_eq!(&buf[4..8], &[0xFF; 4]); // unknown RIFF size
+        assert_eq!(&buf[8..12], b"WAVE");
+        assert_eq!(&buf[12..16], b"fmt ");
+        assert_eq!(u16::from_le_bytes(buf[22..24].try_into().unwrap()), 1); // mono
+        assert_eq!(
+            u32::from_le_bytes(buf[24..28].try_into().unwrap()),
+            44100 // sample rate
+        );
+        assert_eq!(u16::from_le_bytes(buf[34..36].try_into().unwrap()), 16); // bits
+        assert_eq!(&buf[36..40], b"data");
+        assert_eq!(&buf[40..44], &[0xFF; 4]); // unknown data size
+    }
+
+    #[test]
+    fn write_pcm_converts_f32_to_i16_le() {
+        let mut buf = Vec::new();
+        write_pcm(&mut buf, &[0.0, 1.0, -1.0]).unwrap();
+        assert_eq!(buf.len(), 6);
+        assert_eq!(i16::from_le_bytes(buf[0..2].try_into().unwrap()), 0);
+        assert_eq!(i16::from_le_bytes(buf[2..4].try_into().unwrap()), 32767);
+        assert_eq!(i16::from_le_bytes(buf[4..6].try_into().unwrap()), -32767);
     }
 }

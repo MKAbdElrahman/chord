@@ -10,11 +10,13 @@
 //! The mono-modal `text` engine (llama.cpp) is the text-only restriction of
 //! this; `chat` is where the full multimodality lives.
 
+use std::io::{Read, Write};
+
 use chord_core::{
     ChordError, Kind, Message, OptionSpec, Options, Part, Result, Signature, Transform,
 };
 use mistralrs::{
-    AudioInput, IsqBits, ModelBuilder, MultimodalMessages, PagedAttentionMetaBuilder,
+    AudioInput, IsqBits, ModelBuilder, MultimodalMessages, PagedAttentionMetaBuilder, Response,
     TextMessageRole,
 };
 
@@ -127,17 +129,72 @@ impl Transform for Chat {
             .into());
         }
 
-        let model_id = opts.get("model").unwrap_or(DEFAULT_MODEL).to_string();
-        let system = opts.get("system").map(str::to_string);
-        let think = opts.get("think").is_some();
-        // Optional MTP (multi-token-prediction) speculative decoding drafter.
-        let mtp = opts.get("mtp_model").map(|m| Mtp {
-            model: m.to_string(),
-            n_predict: opts.get("mtp_n_predict").and_then(|s| s.parse().ok()),
-        });
-
-        let reply = run(model_id, system, text, images, audios, think, mtp)?;
+        let cfg = ChatCfg::from(opts);
+        let mut reply = String::new();
+        run(cfg, text, images, audios, |tok| {
+            reply.push_str(tok);
+            Ok(())
+        })?;
         Ok(Message::one(Part::text(reply)))
+    }
+
+    /// Raw-singleton fast path: the input stream is the text prompt, and each
+    /// generated token is written (and flushed) the moment the model emits it
+    /// — so `chord chat | chord tts --chunk 80 | aplay` speaks the first
+    /// sentence while the model is still generating (rule R2, engine half).
+    fn apply_raw(
+        &self,
+        input: &mut dyn Read,
+        output: &mut dyn Write,
+        opts: &Options,
+    ) -> Result<()> {
+        let mut text = String::new();
+        input.read_to_string(&mut text)?;
+        let text = text.trim().to_string();
+
+        let mut images = Vec::new();
+        let mut audios = Vec::new();
+        if let Some(path) = opts.get("image") {
+            images.push(decode_image(&read_file(path)?)?);
+        }
+        if let Some(path) = opts.get("audio") {
+            audios.push(decode_audio(&read_file(path)?)?);
+        }
+        if text.is_empty() && images.is_empty() && audios.is_empty() {
+            return Err(ChordError::BadInput(
+                "no input: provide a prompt and/or --image/--audio".into(),
+            )
+            .into());
+        }
+
+        run(ChatCfg::from(opts), text, images, audios, |tok| {
+            output.write_all(tok.as_bytes())?;
+            output.flush()?;
+            Ok(())
+        })
+    }
+}
+
+/// The option-derived knobs of one chat turn.
+struct ChatCfg {
+    model_id: String,
+    system: Option<String>,
+    think: bool,
+    mtp: Option<Mtp>,
+}
+
+impl ChatCfg {
+    fn from(opts: &Options) -> Self {
+        ChatCfg {
+            model_id: opts.get("model").unwrap_or(DEFAULT_MODEL).to_string(),
+            system: opts.get("system").map(str::to_string),
+            think: opts.get("think").is_some(),
+            // Optional MTP (multi-token-prediction) speculative decoding drafter.
+            mtp: opts.get("mtp_model").map(|m| Mtp {
+                model: m.to_string(),
+                n_predict: opts.get("mtp_n_predict").and_then(|s| s.parse().ok()),
+            }),
+        }
     }
 }
 
@@ -147,27 +204,31 @@ struct Mtp {
     n_predict: Option<usize>,
 }
 
-/// Run one multimodal turn synchronously (block on a private tokio runtime).
-fn run(
-    model_id: String,
-    system: Option<String>,
+/// Run one multimodal turn, streaming: each token delta the model emits is
+/// handed to `on_token` as it arrives. Both apply paths share this core —
+/// buffered `apply` collects the deltas, `apply_raw` pipes them out live.
+/// (Blocks on a private tokio runtime; the engine binary is synchronous.)
+fn run<F>(
+    cfg: ChatCfg,
     text: String,
     images: Vec<image::DynamicImage>,
     audios: Vec<AudioInput>,
-    think: bool,
-    mtp: Option<Mtp>,
-) -> Result<String> {
+    mut on_token: F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| ChordError::Engine(format!("tokio runtime: {e}")))?;
 
     rt.block_on(async move {
-        let mut builder = ModelBuilder::new(&model_id).with_auto_isq(IsqBits::Four);
+        let mut builder = ModelBuilder::new(&cfg.model_id).with_auto_isq(IsqBits::Four);
         // MTP speculative decoding: a drafter proposes several tokens that the
         // target verifies. It requires PagedAttention on the target, so enable
         // that alongside it (only when MTP is requested).
-        if let Some(mtp) = mtp {
+        if let Some(mtp) = cfg.mtp {
             builder = builder
                 .with_mtp_model(mtp.model, mtp.n_predict)
                 .with_paged_attn(PagedAttentionMetaBuilder::default().build().map_err(|e| {
@@ -177,29 +238,43 @@ fn run(
         let model = builder
             .build()
             .await
-            .map_err(|e| ChordError::Engine(format!("loading model {model_id}: {e}")))?;
+            .map_err(|e| ChordError::Engine(format!("loading model {}: {e}", cfg.model_id)))?;
 
         let mut msgs = MultimodalMessages::new();
-        if let Some(sys) = system {
+        if let Some(sys) = cfg.system {
             msgs = msgs.add_message(TextMessageRole::System, sys);
         }
         // One user turn carrying the text plus all images and audio. mistral.rs
         // applies the model's own layout/prefix-token rules per modality.
         msgs = msgs
             .add_multimodal_message(TextMessageRole::User, text, images, audios, vec![])
-            .enable_thinking(think);
+            .enable_thinking(cfg.think);
 
-        let resp = model
-            .send_chat_request(msgs)
+        let mut stream = model
+            .stream_chat_request(msgs)
             .await
             .map_err(|e| ChordError::Engine(format!("inference: {e}")))?;
 
-        let content = resp
-            .choices
-            .first()
-            .and_then(|c| c.message.content.clone())
-            .unwrap_or_default();
-        Ok::<String, chord_core::Error>(content)
+        while let Some(resp) = stream.next().await {
+            match resp {
+                Response::Chunk(chunk) => {
+                    for choice in &chunk.choices {
+                        if let Some(content) = &choice.delta.content {
+                            on_token(content)?;
+                        }
+                    }
+                }
+                Response::Done(_) => break,
+                Response::ModelError(msg, _) => {
+                    return Err(ChordError::Engine(format!("inference: {msg}")).into());
+                }
+                Response::InternalError(e) | Response::ValidationError(e) => {
+                    return Err(ChordError::Engine(format!("inference: {e}")).into());
+                }
+                _ => {}
+            }
+        }
+        Ok::<(), chord_core::Error>(())
     })
 }
 

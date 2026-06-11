@@ -83,6 +83,16 @@ impl Signature {
         self.accepts.contains(&kind)
     }
 
+    /// True if at least one kind this transform emits is accepted by `next` —
+    /// the modality check for adjacent pipeline stages. Possibility, not
+    /// certainty: which kind actually flows is runtime data. An empty side
+    /// (an engine that declared no kinds) is treated as unchecked.
+    pub fn connects_to(&self, next: &Signature) -> bool {
+        self.emits.is_empty()
+            || next.accepts.is_empty()
+            || self.emits.iter().any(|k| next.accepts_kind(*k))
+    }
+
     /// Human rendering for `chord ls` / `--help`, e.g. `"text,image,audio -> text"`.
     pub fn display(&self) -> String {
         let join = |ks: &[Kind]| ks.iter().map(Kind::as_str).collect::<Vec<_>>().join(",");
@@ -191,5 +201,54 @@ impl<T: Unary> Transform for T {
         let mut out = Vec::new();
         Unary::apply(self, &mut rd, &mut out, opts)?;
         Ok(Message::one(Part::new(to, out)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mismatched_unary_stages_do_not_connect() {
+        // draw (text -> image) piped into stt (audio -> text) can never work.
+        let draw = Signature::unary(Kind::Text, Kind::Image);
+        let stt = Signature::unary(Kind::Audio, Kind::Text);
+        assert!(!draw.connects_to(&stt));
+    }
+
+    #[test]
+    fn matching_unary_stages_connect() {
+        // stt (audio -> text) into tts (text -> audio).
+        let stt = Signature::unary(Kind::Audio, Kind::Text);
+        let tts = Signature::unary(Kind::Text, Kind::Audio);
+        assert!(stt.connects_to(&tts));
+    }
+
+    #[test]
+    fn multimodal_consumer_connects_on_any_shared_kind() {
+        // chat (text,image,audio -> text) into tts (text -> audio), and back:
+        // tts emits audio, which chat also accepts.
+        let chat = Signature::new(vec![Kind::Text, Kind::Image, Kind::Audio], vec![Kind::Text]);
+        let tts = Signature::unary(Kind::Text, Kind::Audio);
+        assert!(chat.connects_to(&tts));
+        assert!(tts.connects_to(&chat));
+    }
+
+    #[test]
+    fn all_kinds_signature_is_transparent() {
+        // pack/unpack declare every kind on both sides; they must never block a chain.
+        let all = Signature::new(Kind::all().to_vec(), Kind::all().to_vec());
+        let draw = Signature::unary(Kind::Text, Kind::Image);
+        assert!(all.connects_to(&draw));
+        assert!(draw.connects_to(&all));
+    }
+
+    #[test]
+    fn empty_side_is_unchecked() {
+        // A manifest that declared no kinds is treated as unchecked, not incompatible.
+        let none = Signature::new(vec![], vec![]);
+        let stt = Signature::unary(Kind::Audio, Kind::Text);
+        assert!(none.connects_to(&stt));
+        assert!(stt.connects_to(&none));
     }
 }

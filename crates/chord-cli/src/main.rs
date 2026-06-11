@@ -15,7 +15,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{exit, Child, ChildStdout, Stdio};
 
-use chord_core::{ChordError, Kind, Registry, Result, Transform};
+use chord_core::{ChordError, Kind, Registry, Result, Signature, Transform};
 use clap::{Arg, ArgAction, ArgMatches, Command};
 
 use config::Config;
@@ -154,7 +154,7 @@ fn build_cli(reg: &Registry) -> Command {
                 .long_about(
                     "Run a chain of transforms in one process. Separate stages with '::':\n\
                      \n  chord pipeline see --prompt \"what is this\" :: chat --system \"translate to german\" :: tts\n\
-                     \nThe first stage reads its file arg or stdin; each later stage reads the\nprevious stage's output; the last writes stdout.",
+                     \nThe first stage reads its file arg or stdin; each later stage reads the\nprevious stage's output; the last writes stdout. Adjacent stages must\nconnect by kind: each must emit a kind the next accepts (`chord ls`\nshows every transform's signature).",
                 )
                 .arg(
                     Arg::new("stages")
@@ -281,6 +281,25 @@ fn run_filter(t: &dyn Transform, m: &ArgMatches, config: &Config) -> Result<()> 
     Ok(())
 }
 
+/// Reject a chain that can never type-check: each stage must emit at least one
+/// kind its successor accepts ([`Signature::connects_to`]). Checked before any
+/// model is pulled, so an impossible chain fails in milliseconds, not minutes.
+fn check_pipeline_kinds(stages: &[(&str, Signature)]) -> Result<()> {
+    for w in stages.windows(2) {
+        let ((a_name, a_sig), (b_name, b_sig)) = (&w[0], &w[1]);
+        if !a_sig.connects_to(b_sig) {
+            let kinds = |ks: &[Kind]| ks.iter().map(Kind::as_str).collect::<Vec<_>>().join(",");
+            return Err(ChordError::BadInput(format!(
+                "pipeline: {a_name} emits {} but {b_name} accepts {} (see `chord ls`)",
+                kinds(&a_sig.emits),
+                kinds(&b_sig.accepts),
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// Run a multi-stage pipeline as a true streaming chain. Stages are separated by
 /// `::`; each stage is `transform [flags…]`. Every stage's engine process is
 /// spawned at once and wired with OS pipes (stage N's stdout *is* stage N+1's
@@ -331,6 +350,13 @@ fn run_pipeline(m: &ArgMatches, config: &Config) -> Result<()> {
             input,
         });
     }
+
+    // The chain must type-check on kinds before anything heavier happens.
+    let sigs: Vec<(&str, Signature)> = plan
+        .iter()
+        .map(|s| (s.proxy.name(), s.proxy.signature()))
+        .collect();
+    check_pipeline_kinds(&sigs)?;
 
     // Make sure every stage's models are present before the chain starts, so a
     // missing download is resolved up front (one prompt) rather than mid-run.
@@ -495,5 +521,54 @@ fn print_config(config: &Config) {
         for k in keys {
             println!("  {k} = {}", section[k]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chord_core::Signature;
+
+    fn sig(accepts: &[Kind], emits: &[Kind]) -> Signature {
+        Signature::new(accepts.to_vec(), emits.to_vec())
+    }
+
+    #[test]
+    fn compatible_chain_passes() {
+        // stt :: chat :: tts — every joint shares a kind.
+        let stages = [
+            ("stt", sig(&[Kind::Audio], &[Kind::Text])),
+            (
+                "chat",
+                sig(&[Kind::Text, Kind::Image, Kind::Audio], &[Kind::Text]),
+            ),
+            ("tts", sig(&[Kind::Text], &[Kind::Audio])),
+        ];
+        assert!(check_pipeline_kinds(&stages).is_ok());
+    }
+
+    #[test]
+    fn incompatible_joint_is_bad_input_naming_both_stages() {
+        // draw :: stt — image into an audio consumer can never work.
+        let stages = [
+            ("draw", sig(&[Kind::Text], &[Kind::Image])),
+            ("stt", sig(&[Kind::Audio], &[Kind::Text])),
+        ];
+        let err = check_pipeline_kinds(&stages).unwrap_err();
+        let ce = err
+            .downcast_ref::<ChordError>()
+            .expect("categorized BadInput error");
+        assert_eq!(ce.exit_code(), 2);
+        let msg = err.to_string();
+        assert!(msg.contains("draw"), "missing stage name in: {msg}");
+        assert!(msg.contains("stt"), "missing stage name in: {msg}");
+        assert!(msg.contains("image"), "missing emitted kind in: {msg}");
+        assert!(msg.contains("audio"), "missing accepted kind in: {msg}");
+    }
+
+    #[test]
+    fn single_stage_has_no_joints_to_check() {
+        let stages = [("stt", sig(&[Kind::Audio], &[Kind::Text]))];
+        assert!(check_pipeline_kinds(&stages).is_ok());
     }
 }

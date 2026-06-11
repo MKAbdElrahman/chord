@@ -27,10 +27,12 @@ mod transform;
 
 pub use error::ChordError;
 pub use kind::Kind;
-pub use manifest::{Manifest, ManifestOption, MANIFEST_VERSION};
-pub use message::{decode, encode, is_framed, Body, Message, Part, MAGIC_LEN};
+pub use manifest::{Manifest, ManifestOption, ManifestResource, MANIFEST_VERSION};
+pub use message::{
+    decode, encode, is_framed, read_delimited, write_delimited, Body, Message, Part, MAGIC_LEN,
+};
 pub use registry::Registry;
-pub use transform::{OptionSpec, Options, Signature, Transform, Unary};
+pub use transform::{OptionSpec, Options, ResourceSpec, Signature, Transform, Unary};
 
 /// Boxed error type used across the kernel. Keeps the core dependency-free
 /// while letting plug-ins return any `std::error::Error`.

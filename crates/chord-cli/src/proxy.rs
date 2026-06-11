@@ -53,7 +53,17 @@ impl ExecProxy {
         if let Some(fmt) = opts.get("__format") {
             cmd.arg("--format").arg(fmt);
         }
+        // Persistent-worker mode (reserved key set by `chord pipeline --each`).
+        if opts.get("__each") == Some("true") {
+            cmd.arg("--each");
+        }
         cmd
+    }
+
+    /// True when the engine's binary announced the `each` capability — i.e.
+    /// its runner can serve a delimited multi-message stream.
+    pub fn supports_each(&self) -> bool {
+        self.engine.caps.contains(&"each")
     }
 }
 
@@ -97,21 +107,30 @@ pub fn alternates(name: &str) -> Vec<ExecProxy> {
         .collect()
 }
 
-/// Pick the default engine for `name`: the one named exactly `chord-<name>` if
-/// present, else the first discovered backend (so `chord <name>` still works
-/// when only an alternate backend is installed).
+/// Pick the default engine for `name`: the one named exactly `chord-<name>`
+/// if present, else the alternate chosen by [`pick_default`] (so
+/// `chord <name>` still works when only alternate backends are installed).
 fn chosen_default(name: &str) -> Option<&'static Engine> {
-    let mut first = None;
-    for e in discover::engines() {
-        if e.name != name {
-            continue;
-        }
+    pick_default(discover::engines().iter().filter(|e| e.name == name))
+}
+
+/// The default among same-named engines: an exact `chord-<name>` binary wins;
+/// otherwise the lexicographically smallest binary file name. The fallback is
+/// a pure function of the installed set — never of filesystem enumeration
+/// order — so the same install always resolves the same backend (Kahn
+/// determinism, applied to the control plane).
+fn pick_default<'a>(candidates: impl IntoIterator<Item = &'a Engine>) -> Option<&'a Engine> {
+    let mut best: Option<&Engine> = None;
+    for e in candidates {
         if e.is_default {
             return Some(e);
         }
-        first.get_or_insert(e);
+        best = match best {
+            Some(b) if b.bin.file_name() <= e.bin.file_name() => Some(b),
+            _ => Some(e),
+        };
     }
-    first
+    best
 }
 
 impl Transform for ExecProxy {
@@ -129,6 +148,10 @@ impl Transform for ExecProxy {
     }
     fn options(&self) -> &'static [OptionSpec] {
         self.engine.opts
+    }
+
+    fn resources(&self) -> &'static [chord_core::ResourceSpec] {
+        self.engine.resources
     }
 
     fn apply(&self, input: Message, opts: &Options) -> Result<Message> {
@@ -171,5 +194,65 @@ impl Transform for ExecProxy {
         // primary output kind; framed output (multi-part) decodes faithfully.
         let default_kind = self.engine.emits.first().copied().unwrap_or(Kind::Text);
         chord_core::decode(&mut out_buf.as_slice(), default_kind)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn engine(name: &'static str, bin: &str, is_default: bool) -> Engine {
+        Engine {
+            name,
+            accepts: vec![Kind::Audio],
+            emits: vec![Kind::Text],
+            describe: "d",
+            backend: "b",
+            opts: &[],
+            resources: &[],
+            caps: &[],
+            bin: PathBuf::from(bin),
+            is_default,
+        }
+    }
+
+    #[test]
+    fn exact_name_default_wins() {
+        let alt = engine("stt", "/x/chord-stt-llama", false);
+        let def = engine("stt", "/x/chord-stt", true);
+        assert!(pick_default([&alt, &def]).unwrap().is_default);
+    }
+
+    #[test]
+    fn fallback_choice_is_invariant_under_discovery_order() {
+        // Which alternate answers `chord stt` must not depend on filesystem
+        // enumeration order (Kahn determinism, control-plane corollary).
+        let a = engine("stt", "/x/chord-stt-llama", false);
+        let b = engine("stt", "/x/chord-stt-sherpa", false);
+        let p1 = pick_default([&a, &b]).unwrap().bin.clone();
+        let p2 = pick_default([&b, &a]).unwrap().bin.clone();
+        assert_eq!(p1, p2);
+        assert_eq!(p1, PathBuf::from("/x/chord-stt-llama")); // lexicographic
+    }
+
+    #[test]
+    fn supports_each_reflects_the_caps_list() {
+        let mut e = engine("stt", "/x/chord-stt", true);
+        assert!(!ExecProxy {
+            engine: Box::leak(Box::new(e))
+        }
+        .supports_each());
+        e = engine("stt", "/x/chord-stt", true);
+        e.caps = &["each"];
+        assert!(ExecProxy {
+            engine: Box::leak(Box::new(e))
+        }
+        .supports_each());
+    }
+
+    #[test]
+    fn no_candidates_means_no_default() {
+        assert!(pick_default([]).is_none());
     }
 }

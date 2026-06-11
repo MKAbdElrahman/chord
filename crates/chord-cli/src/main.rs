@@ -11,7 +11,7 @@ mod proxy;
 mod pull;
 
 use std::fs::File;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{exit, Child, ChildStdout, Stdio};
 
@@ -157,6 +157,12 @@ fn build_cli(reg: &Registry) -> Command {
                      \nThe first stage reads its file arg or stdin; each later stage reads the\nprevious stage's output; the last writes stdout. Adjacent stages must\nconnect by kind: each must emit a kind the next accepts (`chord ls`\nshows every transform's signature).",
                 )
                 .arg(
+                    Arg::new("each")
+                        .long("each")
+                        .action(ArgAction::SetTrue)
+                        .help("batch mode: one message per stdin line, engines stay loaded across items"),
+                )
+                .arg(
                     Arg::new("stages")
                         .help("stage transforms and flags, separated by '::'")
                         .num_args(1..)
@@ -300,6 +306,39 @@ fn check_pipeline_kinds(stages: &[(&str, Signature)]) -> Result<()> {
     Ok(())
 }
 
+/// Frame each non-empty stdin line as one delimited text message — the host
+/// half of `pipeline --each` (v1 is line-oriented: text in, text out).
+/// Flushed per message so the chain sees items as they arrive.
+fn feed_lines(src: impl BufRead, dst: &mut dyn Write) -> Result<u64> {
+    let mut n = 0;
+    for line in src.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        chord_core::write_delimited(&chord_core::Message::one(chord_core::Part::text(line)), dst)?;
+        dst.flush()?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Print each delimited single-text-part output message as one line — the
+/// collecting half of `pipeline --each`.
+fn collect_text_lines(src: &mut dyn Read, dst: &mut dyn Write) -> Result<u64> {
+    let mut n = 0;
+    while let Some(msg) = chord_core::read_delimited(src)? {
+        let part = msg.single(Kind::Text)?;
+        let bytes = part.force()?;
+        let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+        dst.write_all(bytes)?;
+        dst.write_all(b"\n")?;
+        dst.flush()?;
+        n += 1;
+    }
+    Ok(n)
+}
+
 /// Run a multi-stage pipeline as a true streaming chain. Stages are separated by
 /// `::`; each stage is `transform [flags…]`. Every stage's engine process is
 /// spawned at once and wired with OS pipes (stage N's stdout *is* stage N+1's
@@ -364,6 +403,42 @@ fn run_pipeline(m: &ArgMatches, config: &Config) -> Result<()> {
         .collect();
     check_pipeline_kinds(&sigs)?;
 
+    let each = m.get_flag("each");
+    if each {
+        // Capability handshake (git-protocol style): every stage's binary
+        // must speak the delimited multi-message stream.
+        if let Some(s) = plan.iter().find(|s| !s.proxy.supports_each()) {
+            return Err(ChordError::Engine(format!(
+                "pipeline --each: the {} binary doesn't support multi-message \
+                 streams — rebuild it with the current chord-runner",
+                s.proxy.name()
+            ))
+            .into());
+        }
+        // v1 is line-oriented: one text message per stdin line, one output
+        // line per result.
+        let first = plan[0].proxy.signature();
+        let last = plan[plan.len() - 1].proxy.signature();
+        if !first.accepts_kind(Kind::Text) || !last.emits.contains(&Kind::Text) {
+            return Err(ChordError::BadInput(format!(
+                "pipeline --each reads/writes text lines: first stage must \
+                 accept text (got {}) and last must emit text (got {})",
+                first.display(),
+                last.display()
+            ))
+            .into());
+        }
+        if plan[0].input.is_some() {
+            return Err(ChordError::BadInput(
+                "pipeline --each takes its items from stdin lines, not a file arg".into(),
+            )
+            .into());
+        }
+        for stage in &mut plan {
+            stage.opts.insert("__each", "true");
+        }
+    }
+
     // Make sure every stage's models are present before the chain starts, so a
     // missing download is resolved up front (one prompt) rather than mid-run.
     for stage in &plan {
@@ -400,17 +475,23 @@ fn run_pipeline(m: &ArgMatches, config: &Config) -> Result<()> {
         let mut cmd = stage.proxy.command(&stage.opts);
 
         if i == 0 {
-            match &first_input {
-                FirstInput::Stdin => {
-                    cmd.stdin(Stdio::inherit());
-                }
-                FirstInput::File(p) => {
-                    let f = File::open(p).map_err(|e| format!("opening {}: {e}", p.display()))?;
-                    cmd.stdin(Stdio::from(f));
-                }
-                // Literal text is fed in after spawn, on a thread (below).
-                FirstInput::Literal(_) => {
-                    cmd.stdin(Stdio::piped());
+            if each {
+                // The host frames stdin lines into the chain (feeder below).
+                cmd.stdin(Stdio::piped());
+            } else {
+                match &first_input {
+                    FirstInput::Stdin => {
+                        cmd.stdin(Stdio::inherit());
+                    }
+                    FirstInput::File(p) => {
+                        let f =
+                            File::open(p).map_err(|e| format!("opening {}: {e}", p.display()))?;
+                        cmd.stdin(Stdio::from(f));
+                    }
+                    // Literal text is fed in after spawn, on a thread (below).
+                    FirstInput::Literal(_) => {
+                        cmd.stdin(Stdio::piped());
+                    }
                 }
             }
         } else {
@@ -419,8 +500,9 @@ fn run_pipeline(m: &ArgMatches, config: &Config) -> Result<()> {
             ));
         }
 
-        // The last stage writes straight to our stdout; the rest pipe onward.
-        if i == last {
+        // The last stage writes straight to our stdout (or to the collector
+        // in each-mode); the rest pipe onward.
+        if i == last && !each {
             cmd.stdout(Stdio::inherit());
         } else {
             cmd.stdout(Stdio::piped());
@@ -432,7 +514,15 @@ fn run_pipeline(m: &ArgMatches, config: &Config) -> Result<()> {
             .map_err(|e| format!("cannot run pipeline stage {:?}: {e}", stage.proxy.name()))?;
 
         if i == 0 {
-            if let FirstInput::Literal(bytes) = &first_input {
+            if each {
+                // Feeder: frame stdin lines into the first stage, then close
+                // its stdin — EOF then ends every stage's loop in turn.
+                let mut stdin = child.stdin.take().expect("piped stdin");
+                writer = Some(std::thread::spawn(move || {
+                    let host_in = io::stdin();
+                    let _ = feed_lines(host_in.lock(), &mut stdin);
+                }));
+            } else if let FirstInput::Literal(bytes) = &first_input {
                 let mut stdin = child.stdin.take().expect("piped stdin");
                 let data = bytes.clone();
                 writer = Some(std::thread::spawn(move || {
@@ -445,6 +535,15 @@ fn run_pipeline(m: &ArgMatches, config: &Config) -> Result<()> {
             prev_stdout = child.stdout.take();
         }
         children.push(child);
+    }
+
+    // Each-mode collector: unwrap delimited outputs to stdout lines while the
+    // chain runs (concurrently with the feeder; linear chain, so no deadlock).
+    if each {
+        let mut last_out = children[last].stdout.take().expect("piped stdout");
+        let stdout = io::stdout();
+        let mut host_out = stdout.lock();
+        collect_text_lines(&mut last_out, &mut host_out)?;
     }
 
     // Wait for every stage, collecting the exit codes of those that failed.
@@ -576,5 +675,50 @@ mod tests {
     fn single_stage_has_no_joints_to_check() {
         let stages = [("stt", sig(&[Kind::Audio], &[Kind::Text]))];
         assert!(check_pipeline_kinds(&stages).is_ok());
+    }
+
+    // ---- pipeline --each: host-side line framing ----
+
+    use std::io::Cursor;
+
+    #[test]
+    fn feed_lines_emits_one_delimited_text_message_per_nonempty_line() {
+        let mut buf = Vec::new();
+        let n = feed_lines(Cursor::new("one\n\ntwo\nthree"), &mut buf).unwrap();
+        assert_eq!(n, 3);
+        let mut r = buf.as_slice();
+        let mut texts = Vec::new();
+        while let Some(m) = chord_core::read_delimited(&mut r).unwrap() {
+            texts.push(String::from_utf8(m.parts[0].as_bytes().to_vec()).unwrap());
+        }
+        assert_eq!(texts, ["one", "two", "three"]);
+    }
+
+    #[test]
+    fn collect_text_lines_prints_one_line_per_message() {
+        use chord_core::{write_delimited, Message, Part};
+        let mut stream = Vec::new();
+        // Engines often end text payloads with a newline (writeln!); the
+        // collector must not double-space.
+        for t in ["a\n", "b"] {
+            write_delimited(&Message::one(Part::text(t)), &mut stream).unwrap();
+        }
+        let mut out = Vec::new();
+        let n = collect_text_lines(&mut stream.as_slice(), &mut out).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(out, b"a\nb\n");
+    }
+
+    #[test]
+    fn collect_text_lines_rejects_non_text_output() {
+        use chord_core::{write_delimited, Message, Part};
+        let mut stream = Vec::new();
+        write_delimited(
+            &Message::one(Part::new(Kind::Audio, vec![1, 2])),
+            &mut stream,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        assert!(collect_text_lines(&mut stream.as_slice(), &mut out).is_err());
     }
 }

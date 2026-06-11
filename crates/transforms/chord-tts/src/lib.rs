@@ -17,6 +17,9 @@ mod preprocess;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Unary};
 use ort::session::Session;
 
@@ -90,7 +93,10 @@ impl Unary for Tts {
         let speed: f32 = opts.get_or("speed", "1.05").parse().unwrap_or(1.05);
         let silence: f32 = opts.get_or("silence", "0.3").parse().unwrap_or(0.3);
 
-        let mut engine = Engine::load(opts)?;
+        let engine = engine_for(opts)?;
+        let mut engine = engine
+            .lock()
+            .map_err(|_| ChordError::Engine("tts engine lock poisoned".into()))?;
         let sr = engine.cfg.ae.sample_rate;
 
         let max_len = if lang == "ko" || lang == "ja" {
@@ -169,6 +175,25 @@ struct Engine {
     text_enc: Session,
     vector_est: Session,
     vocoder: Session,
+}
+
+/// Loaded engines, memoized per process by (assets dir, voice): the first
+/// apply pays the ONNX session setup; every later one (the `--each` batch
+/// loop) reuses it (rule R5 in chord's docs/theory/THEORY.md).
+static ENGINES: OnceLock<Mutex<HashMap<(PathBuf, String), Arc<Mutex<Engine>>>>> = OnceLock::new();
+
+fn engine_for(opts: &Options) -> Result<Arc<Mutex<Engine>>> {
+    let key = (resolve_assets(opts), opts.get_or("voice", "M1").to_string());
+    let cache = ENGINES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| ChordError::Engine("tts engine cache poisoned".into()))?;
+    if let Some(e) = cache.get(&key) {
+        return Ok(e.clone());
+    }
+    let e = Arc::new(Mutex::new(Engine::load(opts)?));
+    cache.insert(key, e.clone());
+    Ok(e)
 }
 
 impl Engine {

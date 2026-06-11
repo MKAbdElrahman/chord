@@ -14,7 +14,19 @@
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
-use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Unary};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use chord_core::{ChordError, Kind, OptionSpec, Options, ResourceSpec, Result, Unary};
+
+/// The default model, declared so `chord pull stt` works without the host
+/// hardcoding it (R8). The URL basename matches what `resolve_model_spec`
+/// expects in `models_dir()` for the default "large-v3-turbo" spec.
+const RESOURCES: &[ResourceSpec] = &[ResourceSpec {
+    key: "model",
+    spec: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
+    describe: "whisper large-v3-turbo (~1.5 GB)",
+}];
 
 const OPTS: &[OptionSpec] = &[
     OptionSpec {
@@ -57,6 +69,10 @@ impl Unary for Stt {
         OPTS
     }
 
+    fn resources(&self) -> &'static [ResourceSpec] {
+        RESOURCES
+    }
+
     fn apply(&self, input: &mut dyn Read, output: &mut dyn Write, opts: &Options) -> Result<()> {
         // Route whisper.cpp/ggml logs into hooks that go nowhere (we don't
         // enable the log/tracing backends), silencing the model-load spam on
@@ -69,16 +85,35 @@ impl Unary for Stt {
         input.read_to_end(&mut bytes)?;
         let samples = decode_wav_to_16k_mono(&bytes)?;
 
-        let ctx = WhisperContext::new_with_params(
-            model.to_str().ok_or("model path is not valid UTF-8")?,
-            WhisperContextParameters::default(),
-        )?;
+        let ctx = context_for(&model)?;
 
         let threads: i32 = opts.get_or("threads", "4").parse().unwrap_or(4);
         let text = transcribe_one(&ctx, &samples, opts.get("lang"), threads)?;
         writeln!(output, "{}", text.trim())?;
         Ok(())
     }
+}
+
+/// Loaded whisper contexts, memoized per process by model path: the first
+/// apply pays the load; every later one (the `--each` batch loop) reuses it.
+/// Friedman-Wise forcing semantics — evaluate once, store, never re-evaluate
+/// (rule R5 in chord's docs/theory/THEORY.md).
+static CONTEXTS: OnceLock<Mutex<HashMap<PathBuf, Arc<WhisperContext>>>> = OnceLock::new();
+
+fn context_for(model: &Path) -> Result<Arc<WhisperContext>> {
+    let cache = CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| ChordError::Engine("whisper context cache poisoned".into()))?;
+    if let Some(ctx) = cache.get(model) {
+        return Ok(ctx.clone());
+    }
+    let ctx = Arc::new(WhisperContext::new_with_params(
+        model.to_str().ok_or("model path is not valid UTF-8")?,
+        WhisperContextParameters::default(),
+    )?);
+    cache.insert(model.to_path_buf(), ctx.clone());
+    Ok(ctx)
 }
 
 /// Transcribe one clip with an already-loaded context (the model load is the

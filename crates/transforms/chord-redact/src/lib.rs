@@ -17,13 +17,39 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use chord_core::{ChordError, Kind, OptionSpec, Options, Result, Unary};
+use chord_core::{ChordError, Kind, OptionSpec, Options, ResourceSpec, Result, Unary};
 use ort::session::Session;
 use ort::value::Tensor;
 use tokenizers::Tokenizer;
 
 /// Default PII model: the smallest (4-bit) ONNX export of openai/privacy-filter.
 const DEFAULT_MODEL: &str = "hf:openai/privacy-filter:onnx/model_q4f16.onnx";
+
+/// The default model's files, declared so `chord pull redact` works without
+/// the host hardcoding them (R8): the ONNX graph, its external weights, the
+/// tokenizer, and the config — all from the same repo.
+const RESOURCES: &[ResourceSpec] = &[
+    ResourceSpec {
+        key: "model",
+        spec: "hf:openai/privacy-filter:onnx/model_q4f16.onnx",
+        describe: "privacy-filter PII model (q4f16 ONNX)",
+    },
+    ResourceSpec {
+        key: "model",
+        spec: "hf:openai/privacy-filter:onnx/model_q4f16.onnx_data",
+        describe: "privacy-filter external weights",
+    },
+    ResourceSpec {
+        key: "model",
+        spec: "hf:openai/privacy-filter:tokenizer.json",
+        describe: "privacy-filter tokenizer",
+    },
+    ResourceSpec {
+        key: "model",
+        spec: "hf:openai/privacy-filter:config.json",
+        describe: "privacy-filter config",
+    },
+];
 
 const OPTS: &[OptionSpec] = &[OptionSpec {
     key: "model",
@@ -51,6 +77,10 @@ impl Unary for Redact {
     }
     fn options(&self) -> &'static [OptionSpec] {
         OPTS
+    }
+
+    fn resources(&self) -> &'static [ResourceSpec] {
+        RESOURCES
     }
 
     fn apply(&self, input: &mut dyn Read, output: &mut dyn Write, opts: &Options) -> Result<()> {
@@ -200,8 +230,12 @@ fn category_of(label: &str) -> String {
 /// True if a between-spans gap holds punctuation that ends a clause — a signal
 /// not to bridge two same-category spans across it.
 fn clause_break(gap: &[u8]) -> bool {
-    gap.iter()
-        .any(|b| matches!(b, b'.' | b',' | b';' | b':' | b'!' | b'?' | b'\n' | b'"' | b'(' | b')'))
+    gap.iter().any(|b| {
+        matches!(
+            b,
+            b'.' | b',' | b';' | b':' | b'!' | b'?' | b'\n' | b'"' | b'(' | b')'
+        )
+    })
 }
 
 fn argmax(row: &[f32]) -> usize {

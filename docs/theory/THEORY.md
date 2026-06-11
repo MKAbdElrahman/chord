@@ -100,13 +100,15 @@ engines persist. For chord, L (gigabytes from disk) dwarfs c, so the
 break-even is n = 2.
 
 **Derived rule.**
-- **R5 — hoist model loads out of the per-item loop.** A batch mode
-  (`chord pipeline --each` feeding a *sequence* of framed messages through
-  one set of long-lived engine processes) is the architectural consequence.
-  **Status: roadmap.** The `Transform` contract already mandates
-  statelessness across calls, so engines are loop-ready; the missing pieces
-  are a message delimiter in the framed wire format and a decode→apply→encode
-  loop in `chord-runner`.
+- **R5 — hoist model loads out of the per-item loop.** Implemented as
+  `chord pipeline --each`: a delimited multi-message wire format (an
+  end-of-message sentinel — git filter-process's flush-packet pattern), a
+  per-message loop in `chord-runner` (`filter_each`), capability-gated via
+  the manifest (`caps: ["each"]`, git-handshake style), with engines
+  memoizing loaded models across `apply` calls (stt: whisper context per
+  model path; tts: ONNX sessions per assets+voice). Measured on a 3-item
+  tts::stt batch: per-item marginal cost fell from ~4.1 s (process-per-item
+  loop) to ~1.8 s, with model loads paid exactly once.
 
 ## 5. Lazy evaluation — the mechanism behind R4
 
@@ -148,6 +150,62 @@ blocks on `write` when the consumer lags, capping L without any code.
   bounded channels preserve determinism and add flow control — the standard
   practical refinement.)
 
+## R8 — the host composes; engines deploy
+
+Kahn's Property 2 (the minimal solution is continuous in the system's
+operators) is the license for top-down design: *"we can postpone the
+decision to implement a given function by a single process or a set of
+interconnected processes: this decision will not introduce perturbations in
+the remainder of the system."* chord extends "process or network" to
+**deployment substrate**: an engine may be a CPU binary, a GPU binary, a
+shell script, or an HTTPS client for a remote API — indistinguishable to
+the host.
+
+**The rule.** Everything the host knows about an engine arrives through the
+manifest, and the host may only *interpret* composition-relevant fields:
+name, kinds, options, version, description. Resource and hardware semantics
+are opaque: the host may fetch a declared resource by its URI scheme
+(`hf:`, `https:`) and display metadata, but never encode engine-specific or
+hardware-specific knowledge. The PR test: *does this change make `chord-cli`
+interpret deployment? Then it belongs in an engine.*
+
+Consequences applied:
+- `pull.rs`'s hardcoded per-engine model table was the one violation in the
+  codebase; engines now declare `ResourceSpec`s in their manifests and the
+  host keeps only the scheme handlers and the prompt/progress UX.
+- Hardware adaptation (GPU backends, offload splits) happens inside engines
+  (e.g. ggml dynamic backend loading) or by user choice (`--backend`,
+  config) — never by host-side hardware probing.
+- A remote stage (`chord-chat-openai`) is just another engine; its
+  "resource" is an API key, its `apply` is a network call, and the host
+  needs no concept of "remote".
+
+## Deep-read addenda
+
+A close reading of the primary sources sharpened four points:
+
+- **Memoized forcing (R4 corollary).** Friedman & Wise §III: coercing a
+  suspension must produce the value and *store it back* — never re-evaluate,
+  never silently yield nothing. Hence `Part::force()` errors loudly on an
+  unresolved `Ref` body; eventual ref resolution must materialize-once.
+- **Measurement before optimization (R7).** Little's finite-window theorem
+  (LL.1/LL.2) is *numerically exact on a sample path* — no stationarity, no
+  probability. Timestamped, byte-counted `--format jsonl` events are
+  therefore sufficient to compute each stage's λ, W, L exactly from one
+  run's log. The event schema carries `ts_ms`, `pid`, `duration_ms`,
+  `bytes_in`, `bytes_out` for precisely this.
+- **Prefetch is justified here (R3 refinement).** Denning argues against
+  look-ahead because "there is no reliable advance source of allocation
+  information" — but a pipeline plan IS one. Loading stage N+1's model while
+  stage N computes is sound prepaging, gated on an admission check
+  (Denning's balance policy, eqs. 10–13) once manifests carry memory hints.
+- **Control-plane determinism (R1 corollary).** Kahn's restriction (ii) —
+  lines transmit in *finite* time — motivates the manifest probe timeout;
+  his determinism theorem motivates sorted discovery and an
+  enumeration-order-free default-backend choice. His "2-plicator" shows
+  deterministic fan-out (tee) is sound while fan-in/merge is not — the guard
+  rail for any future pipeline DAG syntax.
+
 ## Rule-to-code map
 
 | Rule | Statement | Where | Status |
@@ -156,8 +214,10 @@ blocks on `write` when the consumer lags, capping L without any code.
 | R2 | Glue never buffers what the kernel doesn't need | `Transform::apply_raw`, `Unary` override, `chord_runner::filter` | implemented |
 | R3 | Residency follows data availability | consequence of R4 under both regimes | implemented |
 | R4 | Models load lazily, inside `apply` | `Transform` contract rule 4; all engines | implemented (now contractual) |
-| R5 | Batch mode amortizes loads over items | `chord pipeline --each` + multi-message framing | **roadmap** |
+| R5 | Batch mode amortizes loads over items | `chord pipeline --each`, `filter_each`, `read/write_delimited`, engine model memoization | implemented |
 | R6 | Backpressure via bounded pipes only | OS pipes in `run_pipeline` | implemented |
+| R7 | Measure before optimizing (Little, exact on sample paths) | `events.rs` ts/pid/duration/bytes; `chord_runner::filter` counting | implemented |
+| R8 | The host composes; engines deploy | `Transform::resources`, manifest `resources`, generic `pull.rs` | implemented |
 
 ## Honest limits
 

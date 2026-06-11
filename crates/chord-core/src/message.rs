@@ -91,11 +91,27 @@ impl Part {
         Part::new(Kind::Text, s.into().into_bytes())
     }
 
-    /// The inline bytes of this part, or an empty slice for a by-reference part.
+    /// The inline bytes of this part, or an empty slice for a by-reference
+    /// part. Non-forcing — for introspection (listings, sizes). A consumer
+    /// that needs the value must call [`force`](Part::force).
     pub fn as_bytes(&self) -> &[u8] {
         match &self.body {
             Body::Inline(b) => b,
             Body::Ref(_) => &[],
+        }
+    }
+
+    /// Force this part's body and return its bytes. Forcing an unresolved
+    /// by-reference part is a loud error — coercing a suspension must produce
+    /// the value, never silently yield nothing (Friedman-Wise §III; rule R4's
+    /// memoized-forcing corollary in `docs/theory/THEORY.md`).
+    pub fn force(&self) -> Result<&[u8]> {
+        match &self.body {
+            Body::Inline(b) => Ok(b),
+            Body::Ref(r) => Err(ChordError::BadInput(format!(
+                "part is by-reference ({r}); ref resolution is not yet supported"
+            ))
+            .into()),
         }
     }
 
@@ -181,22 +197,148 @@ pub fn encode(msg: &Message, w: &mut dyn Write) -> Result<()> {
 
     w.write_all(&MAGIC)?;
     for p in &msg.parts {
-        w.write_all(&[p.kind.tag()])?;
-        write_str(w, &p.mime)?;
-        write_meta(w, &p.meta)?;
-        match &p.body {
-            Body::Inline(bytes) => {
-                w.write_all(&[0u8])?;
-                write_u64(w, bytes.len() as u64)?;
-                w.write_all(bytes)?;
-            }
-            Body::Ref(s) => {
-                w.write_all(&[1u8])?;
-                write_str_u64(w, s)?;
-            }
+        write_part(w, p)?;
+    }
+    Ok(())
+}
+
+/// One part of a framed message: kind tag, mime, meta, body.
+fn write_part(w: &mut dyn Write, p: &Part) -> Result<()> {
+    w.write_all(&[p.kind.tag()])?;
+    write_str(w, &p.mime)?;
+    write_meta(w, &p.meta)?;
+    match &p.body {
+        Body::Inline(bytes) => {
+            w.write_all(&[0u8])?;
+            write_u64(w, bytes.len() as u64)?;
+            w.write_all(bytes)?;
+        }
+        Body::Ref(s) => {
+            w.write_all(&[1u8])?;
+            write_str_u64(w, s)?;
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Delimited streams — the `--each` (multi-message) wire format
+// ---------------------------------------------------------------------------
+
+/// Terminates one message in a delimited stream, where EOF can't (the same
+/// role as git's pkt-line flush packet). Disjoint from every [`Kind`] tag.
+const END_OF_MESSAGE: u8 = 0xFF;
+
+/// Serialize one message onto a multi-message stream: always framed (the
+/// singleton-raw rule is for shell interop, where EOF delimits; here the
+/// [`END_OF_MESSAGE`] sentinel does), terminated by the sentinel.
+pub fn write_delimited(msg: &Message, w: &mut dyn Write) -> Result<()> {
+    w.write_all(&MAGIC)?;
+    for p in &msg.parts {
+        write_part(w, p)?;
+    }
+    w.write_all(&[END_OF_MESSAGE])?;
+    Ok(())
+}
+
+/// Read the next message from a multi-message stream. `Ok(None)` means clean
+/// end-of-stream (EOF at a message boundary); EOF anywhere inside a message
+/// is a truncation error. Reads incrementally — never buffers the stream.
+pub fn read_delimited(r: &mut dyn Read) -> Result<Option<Message>> {
+    let mut magic = [0u8; MAGIC_LEN];
+    let mut n = 0;
+    while n < magic.len() {
+        match r.read(&mut magic[n..]) {
+            Ok(0) if n == 0 => return Ok(None),
+            Ok(0) => return Err(ChordError::BadInput("truncated message frame".into()).into()),
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if magic != MAGIC {
+        return Err(
+            ChordError::BadInput("each-stream message is not framed (bad magic)".into()).into(),
+        );
+    }
+    let mut parts = Vec::new();
+    loop {
+        let tag = read_byte_s(r)?;
+        if tag == END_OF_MESSAGE {
+            break;
+        }
+        let kind = Kind::from_tag(tag)
+            .ok_or_else(|| ChordError::BadInput(format!("bad part kind tag {tag}")))?;
+        let mime = read_str_s(r)?;
+        let meta = read_meta_s(r)?;
+        let body =
+            match read_byte_s(r)? {
+                0 => {
+                    let len = read_u64_s(r)? as usize;
+                    Body::Inline(read_vec_s(r, len)?)
+                }
+                1 => {
+                    let len = read_u64_s(r)? as usize;
+                    Body::Ref(String::from_utf8(read_vec_s(r, len)?).map_err(|_| {
+                        ChordError::BadInput("bad utf8 in message frame".to_string())
+                    })?)
+                }
+                other => {
+                    return Err(ChordError::BadInput(format!("bad body tag {other}")).into());
+                }
+            };
+        parts.push(Part {
+            kind,
+            mime,
+            meta,
+            body,
+        });
+    }
+    Ok(Some(Message { parts }))
+}
+
+// ---- streaming read primitives (exact reads; EOF mid-field is truncation) ----
+
+fn read_vec_s(r: &mut dyn Read, n: usize) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; n];
+    r.read_exact(&mut buf)
+        .map_err(|_| ChordError::BadInput("truncated message frame".into()))?;
+    Ok(buf)
+}
+
+fn read_byte_s(r: &mut dyn Read) -> Result<u8> {
+    Ok(read_vec_s(r, 1)?[0])
+}
+
+fn read_u16_s(r: &mut dyn Read) -> Result<u16> {
+    Ok(u16::from_be_bytes(read_vec_s(r, 2)?.try_into().unwrap()))
+}
+
+fn read_u32_s(r: &mut dyn Read) -> Result<u32> {
+    Ok(u32::from_be_bytes(read_vec_s(r, 4)?.try_into().unwrap()))
+}
+
+fn read_u64_s(r: &mut dyn Read) -> Result<u64> {
+    Ok(u64::from_be_bytes(read_vec_s(r, 8)?.try_into().unwrap()))
+}
+
+fn read_str_s(r: &mut dyn Read) -> Result<String> {
+    let len = read_u16_s(r)? as usize;
+    String::from_utf8(read_vec_s(r, len)?)
+        .map_err(|_| ChordError::BadInput("bad utf8 in message frame".into()).into())
+}
+
+fn read_meta_s(r: &mut dyn Read) -> Result<BTreeMap<String, String>> {
+    let n = read_u16_s(r)? as usize;
+    let mut meta = BTreeMap::new();
+    for _ in 0..n {
+        let k = read_str_s(r)?;
+        let vlen = read_u32_s(r)? as usize;
+        let v = String::from_utf8(read_vec_s(r, vlen)?)
+            .map_err(|_| ChordError::BadInput("bad utf8 in message meta".to_string()))?;
+        meta.insert(k, v);
+    }
+    Ok(meta)
 }
 
 /// Deserialize a message from `r`. Unframed input becomes a single part of
@@ -258,8 +400,11 @@ fn write_u64(w: &mut dyn Write, v: u64) -> Result<()> {
     Ok(())
 }
 /// String with a u16 length prefix (for short fields like MIME and meta keys).
+/// Oversize is an error, never a silently wrapped prefix.
 fn write_str(w: &mut dyn Write, s: &str) -> Result<()> {
-    write_u16(w, s.len() as u16)?;
+    let len = u16::try_from(s.len())
+        .map_err(|_| ChordError::BadInput(format!("string field too long ({} bytes)", s.len())))?;
+    write_u16(w, len)?;
     w.write_all(s.as_bytes())?;
     Ok(())
 }
@@ -270,10 +415,15 @@ fn write_str_u64(w: &mut dyn Write, s: &str) -> Result<()> {
     Ok(())
 }
 fn write_meta(w: &mut dyn Write, meta: &BTreeMap<String, String>) -> Result<()> {
-    write_u16(w, meta.len() as u16)?;
+    let n = u16::try_from(meta.len())
+        .map_err(|_| ChordError::BadInput(format!("too many meta entries ({})", meta.len())))?;
+    write_u16(w, n)?;
     for (k, v) in meta {
         write_str(w, k)?;
-        write_u32(w, v.len() as u32)?;
+        let vlen = u32::try_from(v.len()).map_err(|_| {
+            ChordError::BadInput(format!("meta value too long ({} bytes)", v.len()))
+        })?;
+        write_u32(w, vlen)?;
         w.write_all(v.as_bytes())?;
     }
     Ok(())
@@ -395,6 +545,53 @@ mod tests {
     }
 
     #[test]
+    fn forcing_an_inline_part_yields_its_bytes() {
+        let p = Part::text("hello");
+        assert_eq!(p.force().unwrap(), b"hello");
+    }
+
+    #[test]
+    fn forcing_an_unresolved_ref_part_is_a_loud_error() {
+        // Friedman-Wise: coercing a suspension must produce the value, never
+        // silently yield nothing. Until ref resolution lands, forcing errors.
+        let p = Part {
+            kind: Kind::Video,
+            mime: "video/mp4".into(),
+            meta: BTreeMap::new(),
+            body: Body::Ref("cid:sha256:deadbeef".into()),
+        };
+        let err = p.force().unwrap_err();
+        assert!(err.to_string().contains("by-reference"), "{err}");
+    }
+
+    #[test]
+    fn encode_rejects_oversized_mime_instead_of_corrupting_the_frame() {
+        // A mime longer than the u16 length prefix must be an error, not a
+        // silently wrapped prefix followed by all the bytes.
+        let msg = Message {
+            parts: vec![
+                Part::with_mime(Kind::Text, "x".repeat(70_000), b"a".to_vec()),
+                Part::text("b"), // second part so the message is framed
+            ],
+        };
+        let mut buf = Vec::new();
+        let err = encode(&msg, &mut buf).unwrap_err();
+        assert!(err.to_string().contains("too long"), "{err}");
+    }
+
+    #[test]
+    fn encode_rejects_oversized_meta_key() {
+        let msg = Message {
+            parts: vec![
+                Part::text("a").with_meta("k".repeat(70_000), "v"),
+                Part::text("b"),
+            ],
+        };
+        let mut buf = Vec::new();
+        assert!(encode(&msg, &mut buf).is_err());
+    }
+
+    #[test]
     fn framed_prefix_is_detected() {
         let msg = Message {
             parts: vec![Part::text("a"), Part::text("b")],
@@ -411,6 +608,72 @@ mod tests {
         assert!(!is_framed(b""));
         assert!(!is_framed(&MAGIC[..3])); // shorter than the magic is necessarily raw
         assert!(!is_framed(&[0x89, b'P', b'N', b'G'])); // media magic, not ours
+    }
+
+    // ---- delimited (multi-message) streams: the `--each` wire format ----
+
+    #[test]
+    fn delimited_stream_roundtrips_multiple_messages() {
+        // Three messages on one stream — the persistent-worker pattern
+        // (git filter-process / Bazel workers): explicit message boundaries,
+        // never read-until-EOF.
+        let msgs = [
+            Message::one(Part::text("first")),
+            Message {
+                parts: vec![Part::text("second"), Part::new(Kind::Audio, vec![1, 2, 3])],
+            },
+            Message::one(Part::text("third")),
+        ];
+        let mut buf = Vec::new();
+        for m in &msgs {
+            write_delimited(m, &mut buf).unwrap();
+        }
+        let mut r = buf.as_slice();
+        let mut out = Vec::new();
+        while let Some(m) = read_delimited(&mut r).unwrap() {
+            out.push(m);
+        }
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].parts[0].as_bytes(), b"first");
+        assert_eq!(out[1].parts.len(), 2);
+        assert_eq!(out[1].parts[1].kind, Kind::Audio);
+        assert_eq!(out[2].parts[0].as_bytes(), b"third");
+    }
+
+    #[test]
+    fn delimited_clean_eof_is_end_of_stream() {
+        let mut r: &[u8] = &[];
+        assert!(read_delimited(&mut r).unwrap().is_none());
+    }
+
+    #[test]
+    fn delimited_truncation_mid_message_is_an_error() {
+        let mut buf = Vec::new();
+        write_delimited(&Message::one(Part::text("hello")), &mut buf).unwrap();
+        buf.truncate(buf.len() - 3); // chop the tail (payload + sentinel)
+        let mut r = buf.as_slice();
+        assert!(read_delimited(&mut r).is_err());
+    }
+
+    #[test]
+    fn delimited_singleton_is_framed_not_raw() {
+        // In an each-stream every message is framed — the singleton-raw rule
+        // is for shell interop, where EOF delimits; here the sentinel does.
+        let mut buf = Vec::new();
+        write_delimited(&Message::one(Part::text("x")), &mut buf).unwrap();
+        assert!(is_framed(&buf));
+        assert_ne!(buf, b"x");
+    }
+
+    #[test]
+    fn delimited_empty_message_roundtrips() {
+        // An empty Message is a valid item (distinct from end-of-stream).
+        let mut buf = Vec::new();
+        write_delimited(&Message::empty(), &mut buf).unwrap();
+        let mut r = buf.as_slice();
+        let m = read_delimited(&mut r).unwrap().unwrap();
+        assert!(m.is_empty());
+        assert!(read_delimited(&mut r).unwrap().is_none());
     }
 
     #[test]

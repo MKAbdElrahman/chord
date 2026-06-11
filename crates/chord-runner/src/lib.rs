@@ -31,7 +31,11 @@ pub fn run(t: &dyn Transform) -> ExitCode {
     // discovers the plug-in, so the engine's own `Transform` impl is the single
     // source of truth for its name, kinds, backend, and options.
     if std::env::args().any(|a| a == "--chord-manifest") {
-        match serde_json::to_string(&Manifest::of(t)) {
+        let mut manifest = Manifest::of(t);
+        // The per-message loop lives in this runner, so every engine built
+        // with it can serve a delimited multi-message stream.
+        manifest.caps.push("each".to_string());
+        match serde_json::to_string(&manifest) {
             Ok(json) => {
                 println!("{json}");
                 return ExitCode::SUCCESS;
@@ -65,26 +69,42 @@ pub fn run(t: &dyn Transform) -> ExitCode {
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
+    let each = matches.get_flag("each");
 
-    let result = (|| -> chord_core::Result<()> {
+    let started = std::time::Instant::now();
+    let result = (|| -> chord_core::Result<FilterStats> {
         match matches.get_one::<String>("input") {
             Some(path) if path != "-" => {
                 let mut f = std::fs::File::open(path)
                     .map_err(|e| -> chord_core::Error { format!("opening {path}: {e}").into() })?;
-                filter(t, &mut f, &mut out, &opts)
+                if each {
+                    run_each(t, &mut f, &mut out, &opts)
+                } else {
+                    filter(t, &mut f, &mut out, &opts)
+                }
             }
             _ => {
                 let stdin = io::stdin();
                 let mut input = stdin.lock();
-                filter(t, &mut input, &mut out, &opts)
+                if each {
+                    run_each(t, &mut input, &mut out, &opts)
+                } else {
+                    filter(t, &mut input, &mut out, &opts)
+                }
             }
         }
     })();
+    let duration_ms = started.elapsed().as_millis() as u64;
 
     match result {
-        Ok(()) => {
+        Ok(stats) => {
             if jsonl {
-                emit(&events::Done::new(t.name()));
+                emit(&events::Done::new(
+                    t.name(),
+                    duration_ms,
+                    stats.bytes_in,
+                    stats.bytes_out,
+                ));
             }
             ExitCode::SUCCESS
         }
@@ -94,12 +114,15 @@ pub fn run(t: &dyn Transform) -> ExitCode {
             let ce = e.downcast_ref::<ChordError>();
             let code = ce.map(ChordError::exit_code).unwrap_or(1);
             if jsonl {
-                emit(&events::Error::new(
-                    t.name(),
-                    code,
-                    ce.map(ChordError::kind).unwrap_or("engine"),
-                    e.to_string(),
-                ));
+                emit(
+                    &events::Error::new(
+                        t.name(),
+                        code,
+                        ce.map(ChordError::kind).unwrap_or("engine"),
+                        e.to_string(),
+                    )
+                    .with_duration(duration_ms),
+                );
             } else {
                 eprintln!("chord-{}: {e}", t.name());
             }
@@ -108,16 +131,112 @@ pub fn run(t: &dyn Transform) -> ExitCode {
     }
 }
 
+/// Exact byte counts from one [`filter`] run — the per-item measurements
+/// Little's finite-window theorem turns into λ, W, and L for a stage.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FilterStats {
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+}
+
+/// Counts bytes flowing through a reader.
+struct CountingReader<R> {
+    inner: R,
+    count: u64,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.count += n as u64;
+        Ok(n)
+    }
+}
+
+/// Counts bytes flowing through a writer.
+struct CountingWriter<W> {
+    inner: W,
+    count: u64,
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.count += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Run `t` as a persistent worker over a delimited multi-message stream:
+/// read messages until clean EOF, applying each and writing its delimited
+/// reply **immediately** (flushed per message, so downstream stages see
+/// items as they finish, not at process exit). Returns the message count.
+///
+/// This is the model-load amortization seam (rule R5 in
+/// `docs/theory/THEORY.md`): whatever an engine loads on the first `apply`
+/// stays in process memory for all subsequent ones — Friedman-Wise
+/// memoization made structural.
+pub fn filter_each(
+    t: &dyn Transform,
+    input: &mut dyn Read,
+    output: &mut dyn Write,
+    opts: &Options,
+) -> chord_core::Result<u64> {
+    let mut n = 0;
+    while let Some(msg) = chord_core::read_delimited(input)? {
+        let reply = t.apply(msg, opts)?;
+        chord_core::write_delimited(&reply, output)?;
+        output.flush()?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// [`filter_each`] with byte accounting, for the `--format jsonl` Done event.
+fn run_each(
+    t: &dyn Transform,
+    input: &mut dyn Read,
+    output: &mut dyn Write,
+    opts: &Options,
+) -> chord_core::Result<FilterStats> {
+    let mut input = CountingReader {
+        inner: input,
+        count: 0,
+    };
+    let mut output = CountingWriter {
+        inner: output,
+        count: 0,
+    };
+    filter_each(t, &mut input, &mut output, opts)?;
+    Ok(FilterStats {
+        bytes_in: input.count,
+        bytes_out: output.count,
+    })
+}
+
 /// Run `t` over one input stream: peek the frame discriminator, then either
 /// hand a raw stream to the transform's streaming path ([`Transform::apply_raw`])
 /// or decode a framed message (buffered). The glue holds only the
 /// discriminator prefix, never the stream — rule R2 in `docs/theory/THEORY.md`.
+/// Returns exact byte counts for `--format jsonl` instrumentation.
 pub fn filter(
     t: &dyn Transform,
     input: &mut dyn Read,
     output: &mut dyn Write,
     opts: &Options,
-) -> chord_core::Result<()> {
+) -> chord_core::Result<FilterStats> {
+    let mut input = CountingReader {
+        inner: input,
+        count: 0,
+    };
+    let mut output = CountingWriter {
+        inner: output,
+        count: 0,
+    };
+
     // Peek exactly enough leading bytes to tell framed from raw. EOF before
     // a full magic means the stream is raw (or empty).
     let mut head = [0u8; chord_core::MAGIC_LEN];
@@ -130,20 +249,24 @@ pub fn filter(
             Err(e) => return Err(e.into()),
         }
     }
-    let mut rest = Cursor::new(head[..n].to_vec()).chain(input);
+    let mut rest = Cursor::new(head[..n].to_vec()).chain(&mut input);
     if n == 0 || chord_core::is_framed(&head[..n]) {
         // Framed (multi-part) — or empty, which must stay an empty Message so
         // source transforms keep their flags-only behavior. Buffered path:
         // decode the whole message, apply, encode.
         let msg = chord_core::decode(&mut rest, t.signature().primary_in())?;
         let out = t.apply(msg, opts)?;
-        chord_core::encode(&out, output)
+        chord_core::encode(&out, &mut output)?;
     } else {
         // Raw singleton: stream straight through. Unary engines never buffer
         // in the glue; whole-message transforms fall back to the buffered
         // default impl of apply_raw.
-        t.apply_raw(&mut rest, output, opts)
+        t.apply_raw(&mut rest, &mut output, opts)?;
     }
+    Ok(FilterStats {
+        bytes_in: input.count,
+        bytes_out: output.count,
+    })
 }
 
 /// Initialize structured logging once: engine/native-library diagnostics go to
@@ -195,6 +318,12 @@ fn build_command(t: &dyn Transform) -> Command {
             .value_parser(["text", "jsonl"])
             .default_value("text")
             .help("output format: text, or jsonl for lifecycle/error events on stderr"),
+    )
+    .arg(
+        Arg::new("each")
+            .long("each")
+            .action(ArgAction::SetTrue)
+            .help("persistent-worker mode: serve a stream of delimited messages until EOF"),
     )
 }
 
@@ -301,5 +430,76 @@ mod tests {
         // Source transforms (pack) build output from flags alone; empty stdin
         // must reach apply as Message::empty().
         assert_eq!(run_filter(&CountParts, b""), b"0");
+    }
+
+    #[test]
+    fn each_loop_processes_every_message_and_delimits_output() {
+        // The persistent-worker loop: N delimited messages in, N delimited
+        // messages out, on one process — the model-load amortization seam.
+        use chord_core::{read_delimited, write_delimited};
+        let mut input = Vec::new();
+        for text in ["alpha", "beta", "gamma"] {
+            write_delimited(&Message::one(Part::text(text)), &mut input).unwrap();
+        }
+        let mut out = Vec::new();
+        let n = filter_each(&Upper, &mut Cursor::new(input), &mut out, &Options::new()).unwrap();
+        assert_eq!(n, 3);
+
+        let mut r = out.as_slice();
+        let mut replies = Vec::new();
+        while let Some(m) = read_delimited(&mut r).unwrap() {
+            replies.push(String::from_utf8(m.parts[0].as_bytes().to_vec()).unwrap());
+        }
+        assert_eq!(replies, ["ALPHA", "BETA", "GAMMA"]);
+    }
+
+    #[test]
+    fn each_loop_on_empty_stream_is_zero_messages() {
+        let mut out = Vec::new();
+        let n = filter_each(
+            &Upper,
+            &mut Cursor::new(Vec::new()),
+            &mut out,
+            &Options::new(),
+        )
+        .unwrap();
+        assert_eq!(n, 0);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn filter_reports_exact_byte_counts_for_raw_input() {
+        // Little's Law instrumentation: byte counts must be exact.
+        let mut out = Vec::new();
+        let stats = filter(
+            &Upper,
+            &mut Cursor::new(b"hello".to_vec()),
+            &mut out,
+            &Options::new(),
+        )
+        .unwrap();
+        assert_eq!(stats.bytes_in, 5);
+        assert_eq!(stats.bytes_out, 5);
+    }
+
+    #[test]
+    fn filter_reports_exact_byte_counts_for_framed_input() {
+        let msg = Message {
+            parts: vec![Part::text("a"), Part::text("b")],
+        };
+        let mut framed = Vec::new();
+        encode(&msg, &mut framed).unwrap();
+        let framed_len = framed.len() as u64;
+
+        let mut out = Vec::new();
+        let stats = filter(
+            &CountParts,
+            &mut Cursor::new(framed),
+            &mut out,
+            &Options::new(),
+        )
+        .unwrap();
+        assert_eq!(stats.bytes_in, framed_len);
+        assert_eq!(stats.bytes_out, 1); // the "2" reply
     }
 }

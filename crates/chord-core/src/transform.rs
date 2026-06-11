@@ -45,6 +45,23 @@ pub struct OptionSpec {
     pub takes_value: bool,
 }
 
+/// A fetchable resource (model/asset) a transform needs, declared by the
+/// engine so the host can fetch it **without knowing anything
+/// engine-specific** (rule R8: the host composes, engines deploy). The host
+/// understands only the reference *schemes* (`hf:`, `https:`) — never which
+/// engine wants which file.
+#[derive(Debug, Clone, Copy)]
+pub struct ResourceSpec {
+    /// The option key that overrides this resource (e.g. `"model"`). The
+    /// host ensures the resource only when that option is unset — a user
+    /// supplying their own path opts out of the default.
+    pub key: &'static str,
+    /// Resolvable reference: an `hf:` ref or a direct `https:` URL.
+    pub spec: &'static str,
+    /// Human label for download prompts and progress bars.
+    pub describe: &'static str,
+}
+
 /// The kinds a transform consumes and produces. Coarse on purpose: the kernel
 /// type-checks on modality (`accepts ∩ next.emits`), while exact codecs/order
 /// are an engine/adapter concern. A mono-modal transform has one of each.
@@ -138,6 +155,15 @@ pub trait Transform: Send + Sync {
         &[]
     }
 
+    /// Fetchable resources (default models/assets) this transform needs.
+    /// Declared here — never in the host — so `chord pull <name>` works
+    /// without the host hardcoding any engine knowledge (rule R8). Defaults
+    /// to none (engine-less, self-downloading, or user-supplied-model
+    /// transforms).
+    fn resources(&self) -> &'static [ResourceSpec] {
+        &[]
+    }
+
     /// Transform an input message into an output message.
     fn apply(&self, input: Message, opts: &Options) -> Result<Message>;
 
@@ -192,6 +218,11 @@ pub trait Unary: Send + Sync {
         &[]
     }
 
+    /// Fetchable resources (default models/assets); see [`Transform::resources`].
+    fn resources(&self) -> &'static [ResourceSpec] {
+        &[]
+    }
+
     /// Read the single input part's bytes, write the single output part's bytes.
     fn apply(&self, input: &mut dyn Read, output: &mut dyn Write, opts: &Options) -> Result<()>;
 }
@@ -220,10 +251,14 @@ impl<T: Unary> Transform for T {
         Unary::options(self)
     }
 
+    fn resources(&self) -> &'static [ResourceSpec] {
+        Unary::resources(self)
+    }
+
     fn apply(&self, input: Message, opts: &Options) -> Result<Message> {
         let from = Unary::from(self);
         let to = Unary::to(self);
-        let bytes = input.single(from)?.as_bytes().to_vec();
+        let bytes = input.single(from)?.force()?.to_vec();
         let mut rd = Cursor::new(bytes);
         let mut out = Vec::new();
         Unary::apply(self, &mut rd, &mut out, opts)?;
@@ -319,6 +354,20 @@ mod tests {
         fn apply(&self, input: Message, _o: &Options) -> Result<Message> {
             Ok(Message::one(Part::text(input.parts.len().to_string())))
         }
+    }
+
+    #[test]
+    fn unary_rejects_an_unresolved_ref_part() {
+        // The blanket impl forces the input part; an unresolved by-reference
+        // body must error loudly, not be processed as empty bytes.
+        let msg = Message::one(Part {
+            kind: Kind::Text,
+            mime: "text/plain".into(),
+            meta: Default::default(),
+            body: crate::message::Body::Ref("cid:xyz".into()),
+        });
+        let err = Transform::apply(&Head8, msg, &Options::new()).unwrap_err();
+        assert!(err.to_string().contains("by-reference"), "{err}");
     }
 
     #[test]

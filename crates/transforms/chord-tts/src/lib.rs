@@ -86,13 +86,6 @@ impl Unary for Tts {
     }
 
     fn apply(&self, input: &mut dyn Read, output: &mut dyn Write, opts: &Options) -> Result<()> {
-        let mut text = String::new();
-        input.read_to_string(&mut text)?;
-        let text = text.trim();
-        if text.is_empty() {
-            return Err(ChordError::BadInput("no input text".to_string()).into());
-        }
-
         let lang = opts.get_or("lang", "en").to_string();
         let steps: usize = opts.get_or("steps", "8").parse().unwrap_or(8);
         let speed: f32 = opts.get_or("speed", "1.05").parse().unwrap_or(1.05);
@@ -114,23 +107,62 @@ impl Unary for Tts {
             .and_then(|v| v.parse().ok())
             .filter(|&n: &usize| n > 0)
             .unwrap_or(default_len);
-        let chunks = preprocess::chunk_text(text, max_len);
 
-        // Stream: unknown-length WAV header first (the live-source
-        // convention), then each chunk's samples the moment they're
-        // synthesized, flushed — so a downstream player starts on chunk 1
-        // while chunk 2 is still computing (rule R2, engine half).
-        write_wav_stream_header(output, sr as u32)?;
-        for (i, chunk) in chunks.iter().enumerate() {
-            let (wav, dur) = engine.infer(chunk, &lang, steps, speed)?;
-            let n = ((sr as f32) * dur) as usize;
-            let clip = &wav[..n.min(wav.len())];
-            if i > 0 {
-                let gap = (silence * sr as f32) as usize;
-                write_pcm(output, &vec![0.0_f32; gap])?;
+        // Incremental: synthesize each complete sentence as it arrives, so an
+        // upstream token stream (chord chat) overlaps with synthesis instead
+        // of waiting for its EOF. `raw` holds bytes whose UTF-8 may be split
+        // mid-character by the pipe; only the valid prefix moves to `pending`.
+        let mut raw: Vec<u8> = Vec::new();
+        let mut pending = String::new();
+        let mut emitted = 0usize;
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = input.read(&mut buf)?;
+            if n == 0 {
+                break;
             }
-            write_pcm(output, clip)?;
-            output.flush()?;
+            raw.extend_from_slice(&buf[..n]);
+            let valid_up_to = match std::str::from_utf8(&raw) {
+                Ok(_) => raw.len(),
+                Err(e) => e.valid_up_to(),
+            };
+            if valid_up_to > 0 {
+                pending.push_str(std::str::from_utf8(&raw[..valid_up_to]).unwrap());
+                raw.drain(..valid_up_to);
+            }
+            while let Some(chunk) = preprocess::take_stream_chunk(&mut pending, max_len) {
+                synth_chunk(
+                    &mut engine,
+                    output,
+                    &chunk,
+                    &lang,
+                    steps,
+                    speed,
+                    sr,
+                    silence,
+                    emitted == 0,
+                )?;
+                emitted += 1;
+            }
+        }
+        // EOF: whatever remains goes through the offline chunker.
+        pending.push_str(&String::from_utf8_lossy(&raw));
+        for chunk in preprocess::chunk_text(pending.trim(), max_len) {
+            synth_chunk(
+                &mut engine,
+                output,
+                &chunk,
+                &lang,
+                steps,
+                speed,
+                sr,
+                silence,
+                emitted == 0,
+            )?;
+            emitted += 1;
+        }
+        if emitted == 0 {
+            return Err(ChordError::BadInput("no input text".to_string()).into());
         }
         Ok(())
     }
@@ -352,6 +384,34 @@ fn read(path: impl AsRef<Path>) -> Result<String> {
 }
 
 // ---- WAV output -------------------------------------------------------------
+
+/// Synthesize one chunk and stream it: the unknown-length WAV header before
+/// the first chunk, an inter-chunk silence gap before later ones, then the
+/// clip's PCM — flushed, so a downstream player starts immediately.
+#[allow(clippy::too_many_arguments)]
+fn synth_chunk(
+    engine: &mut Engine,
+    output: &mut dyn Write,
+    chunk: &str,
+    lang: &str,
+    steps: usize,
+    speed: f32,
+    sr: usize,
+    silence: f32,
+    first: bool,
+) -> Result<()> {
+    if first {
+        write_wav_stream_header(output, sr as u32)?;
+    } else {
+        let gap = (silence * sr as f32) as usize;
+        write_pcm(output, &vec![0.0_f32; gap])?;
+    }
+    let (wav, dur) = engine.infer(chunk, lang, steps, speed)?;
+    let n = ((sr as f32) * dur) as usize;
+    write_pcm(output, &wav[..n.min(wav.len())])?;
+    output.flush()?;
+    Ok(())
+}
 
 /// WAV header for a stream of unknown length: RIFF and data sizes are
 /// 0xFFFFFFFF (the ffmpeg/sox live-source convention). 16-bit mono PCM.

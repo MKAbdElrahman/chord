@@ -57,6 +57,10 @@ pub struct Done<'a> {
     pub bytes_in: u64,
     /// Bytes written to the output stream.
     pub bytes_out: u64,
+    /// 1-based item index within an `--each` batch; absent for the
+    /// whole-run summary event.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub item: Option<u64>,
 }
 
 impl<'a> Done<'a> {
@@ -69,7 +73,14 @@ impl<'a> Done<'a> {
             duration_ms,
             bytes_in,
             bytes_out,
+            item: None,
         }
+    }
+
+    /// Tag this event with its batch item index (builder style).
+    pub fn with_item(mut self, item: u64) -> Self {
+        self.item = Some(item);
+        self
     }
 }
 
@@ -137,6 +148,16 @@ mod tests {
         for key in ["ts_ms", "pid", "duration_ms", "bytes_in", "bytes_out"] {
             assert!(json.contains(&format!("\"{key}\"")), "{key} in {json}");
         }
+    }
+
+    #[test]
+    fn done_item_index_is_optional_and_serialized_when_set() {
+        // Per-message events in --each batches carry an item index; the
+        // batch-summary Done omits it entirely (no noisy null).
+        let summary = serde_json::to_string(&Done::new("stt", 1, 2, 3)).unwrap();
+        assert!(!summary.contains("\"item\""), "{summary}");
+        let per_item = serde_json::to_string(&Done::new("stt", 1, 2, 3).with_item(7)).unwrap();
+        assert!(per_item.contains("\"item\":7"), "{per_item}");
     }
 
     #[test]

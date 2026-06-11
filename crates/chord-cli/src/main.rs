@@ -403,6 +403,16 @@ fn run_pipeline(m: &ArgMatches, config: &Config) -> Result<()> {
         .collect();
     check_pipeline_kinds(&sigs)?;
 
+    // Relay the global output format to every stage (the per-stage parser
+    // doesn't define the global flag, so opts_from can't see it here).
+    if let Some(fmt) = m.get_one::<String>("format") {
+        if fmt != "text" {
+            for stage in &mut plan {
+                stage.opts.insert("__format", fmt.clone());
+            }
+        }
+    }
+
     let each = m.get_flag("each");
     if each {
         // Capability handshake (git-protocol style): every stage's binary

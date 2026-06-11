@@ -78,7 +78,7 @@ pub fn run(t: &dyn Transform) -> ExitCode {
                 let mut f = std::fs::File::open(path)
                     .map_err(|e| -> chord_core::Error { format!("opening {path}: {e}").into() })?;
                 if each {
-                    run_each(t, &mut f, &mut out, &opts)
+                    run_each(t, &mut f, &mut out, &opts, jsonl)
                 } else {
                     filter(t, &mut f, &mut out, &opts)
                 }
@@ -87,7 +87,7 @@ pub fn run(t: &dyn Transform) -> ExitCode {
                 let stdin = io::stdin();
                 let mut input = stdin.lock();
                 if each {
-                    run_each(t, &mut input, &mut out, &opts)
+                    run_each(t, &mut input, &mut out, &opts, jsonl)
                 } else {
                     filter(t, &mut input, &mut out, &opts)
                 }
@@ -185,23 +185,30 @@ pub fn filter_each(
     output: &mut dyn Write,
     opts: &Options,
 ) -> chord_core::Result<u64> {
-    let mut n = 0;
-    while let Some(msg) = chord_core::read_delimited(input)? {
-        let reply = t.apply(msg, opts)?;
-        chord_core::write_delimited(&reply, output)?;
-        output.flush()?;
-        n += 1;
-    }
-    Ok(n)
+    Ok(filter_each_observed(t, input, output, opts, |_| {})?.0)
 }
 
-/// [`filter_each`] with byte accounting, for the `--format jsonl` Done event.
-fn run_each(
+/// Measurements for one item of an `--each` batch, handed to the observer.
+/// `duration_ms` is service time — from the message fully read to its reply
+/// flushed — so item 1 visibly carries the model load and later items don't.
+#[derive(Debug, Clone, Copy)]
+pub struct ItemStats {
+    /// 1-based index within the batch.
+    pub item: u64,
+    pub duration_ms: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+}
+
+/// [`filter_each`] with a per-item observer and exact byte accounting —
+/// the per-item half of the Little's-Law instrumentation (rule R7).
+pub fn filter_each_observed(
     t: &dyn Transform,
     input: &mut dyn Read,
     output: &mut dyn Write,
     opts: &Options,
-) -> chord_core::Result<FilterStats> {
+    mut observe: impl FnMut(&ItemStats),
+) -> chord_core::Result<(u64, FilterStats)> {
     let mut input = CountingReader {
         inner: input,
         count: 0,
@@ -210,11 +217,52 @@ fn run_each(
         inner: output,
         count: 0,
     };
-    filter_each(t, &mut input, &mut output, opts)?;
-    Ok(FilterStats {
-        bytes_in: input.count,
-        bytes_out: output.count,
-    })
+    let mut n = 0;
+    loop {
+        let in_before = input.count;
+        let out_before = output.count;
+        let Some(msg) = chord_core::read_delimited(&mut input)? else {
+            break;
+        };
+        let started = std::time::Instant::now();
+        let reply = t.apply(msg, opts)?;
+        chord_core::write_delimited(&reply, &mut output)?;
+        output.flush()?;
+        n += 1;
+        observe(&ItemStats {
+            item: n,
+            duration_ms: started.elapsed().as_millis() as u64,
+            bytes_in: input.count - in_before,
+            bytes_out: output.count - out_before,
+        });
+    }
+    Ok((
+        n,
+        FilterStats {
+            bytes_in: input.count,
+            bytes_out: output.count,
+        },
+    ))
+}
+
+/// [`filter_each_observed`] wired to jsonl: one `Done` event per item (tagged
+/// with its index), leaving the whole-run summary event to the caller.
+fn run_each(
+    t: &dyn Transform,
+    input: &mut dyn Read,
+    output: &mut dyn Write,
+    opts: &Options,
+    jsonl: bool,
+) -> chord_core::Result<FilterStats> {
+    let name = t.name().to_string();
+    let (_, stats) = filter_each_observed(t, input, output, opts, |s| {
+        if jsonl {
+            emit(
+                &events::Done::new(&name, s.duration_ms, s.bytes_in, s.bytes_out).with_item(s.item),
+            );
+        }
+    })?;
+    Ok(stats)
 }
 
 /// Run `t` over one input stream: peek the frame discriminator, then either
@@ -451,6 +499,43 @@ mod tests {
             replies.push(String::from_utf8(m.parts[0].as_bytes().to_vec()).unwrap());
         }
         assert_eq!(replies, ["ALPHA", "BETA", "GAMMA"]);
+    }
+
+    #[test]
+    fn each_loop_observer_sees_per_item_stats() {
+        use chord_core::{read_delimited, write_delimited};
+        let mut input = Vec::new();
+        for text in ["a", "bb", "ccc"] {
+            write_delimited(&Message::one(Part::text(text)), &mut input).unwrap();
+        }
+        let total_in = input.len() as u64;
+
+        let mut items = Vec::new();
+        let mut out = Vec::new();
+        let (n, totals) = filter_each_observed(
+            &Upper,
+            &mut Cursor::new(input),
+            &mut out,
+            &Options::new(),
+            |s| items.push((s.item, s.bytes_in, s.bytes_out)),
+        )
+        .unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(items.len(), 3);
+        // Item indices are 1-based and ordered.
+        assert_eq!(items.iter().map(|i| i.0).collect::<Vec<_>>(), vec![1, 2, 3]);
+        // Per-item byte deltas are exact: they sum to the stream totals.
+        assert_eq!(items.iter().map(|i| i.1).sum::<u64>(), total_in);
+        assert_eq!(items.iter().map(|i| i.2).sum::<u64>(), totals.bytes_out);
+        assert_eq!(totals.bytes_in, total_in);
+        // Bigger payloads move more bytes.
+        assert!(items[2].1 > items[0].1);
+        let mut r = out.as_slice();
+        let mut texts = Vec::new();
+        while let Some(m) = read_delimited(&mut r).unwrap() {
+            texts.push(String::from_utf8(m.parts[0].as_bytes().to_vec()).unwrap());
+        }
+        assert_eq!(texts, ["A", "BB", "CCC"]);
     }
 
     #[test]
